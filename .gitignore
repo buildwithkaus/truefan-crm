@@ -1,0 +1,17 @@
+# Secrets — never commit
+config/.env
+config/*.local.*
+*.key
+*secret*
+
+# Raw data exports / backups — real business & customer data, not for git history
+/data/**
+!/data/.gitkeep
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+
+# PowerShell transcripts
+*.transcript
