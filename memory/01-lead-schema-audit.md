@@ -18,25 +18,62 @@ Raw dump: `data/lead_fields_schema.json` (not in git; re-pull via
   on any edit including automated field updates). Use this for any "is this lead actually
   being worked" filter.
 
-## ProspectStage — current state: 26 values, mixing 4 different concepts
+## ProspectStage — current state: 28 values (CORRECTED 2026-07-28), mixing 4 different concepts
 
-Full list (verified live, not from docs): Fresh Lead, Conversation In Progress (Hot),
-Requirement Gathering (Warm), ReQualified By WhatsApp, SaaS, No Requirement of Celeb in
-Ads, Conflict, Retargetedlead, RetargetedleadEMAIL, Payment Received, Disqualified,
-Invalid/Junk, Not Active After First Conversation, Future Prospect, Follow Up, Call me
-Later, Didn't Picked, RNR, Wrong Number, Low Budget, Supply Issue, Does not want AI, Just
-Enquiring No Intent, Switched Off/Not Reachable, FB Lead - Website, B2B-Disqualified.
+**The earlier 26-value list in this file had three wrong strings and was missing three
+values.** Corrected by a full paginated enumeration of all 86,628 leads — tallying actual
+stored values rather than probing a guessed list. Counts reconcile to exactly 86,628 with
+**0 blank/null** stages.
 
-**Proposed split** (design, not yet migrated — see `06-stage-taxonomy-design.md` for the
-full mapping):
-- Kept as lifecycle stage (6): Fresh Lead → Contacted → Engaged → Requirement Gathering
-  (Warm) → Hot → Converted to Opportunity
-- Moves to Activity Disposition: RNR, Didn't Picked, Call me Later, Switched Off/Not
-  Reachable, Wrong Number
-- Moves to a new Disqualification/Loss Reason field: Low Budget, Supply Issue, Conflict,
-  No Requirement of Celeb in Ads, Does not want AI, Just Enquiring No Intent, Invalid/Junk
-- Moves to Source/Segment attributes: SaaS, FB Lead - Website, B2B-Disqualified,
-  Retargetedlead, RetargetedleadEMAIL, ReQualified By WhatsApp
+| Value (exact string) | Count |
+|---|---|
+| Disqualified | 25,078 |
+| **`Invalid/ Junk`** (space after the slash) | **17,340** |
+| Didn't Picked | 12,094 |
+| Low Budget | 5,891 |
+| Wrong Number | 4,753 |
+| Switched Off/Not Reachable | 4,649 |
+| **`Just Enquiring, No Intent`** (comma) | **2,736** |
+| Future Prospect | 2,686 |
+| Follow Up | 2,558 |
+| No Requirement of Celeb in Ads | 1,901 |
+| Fresh Lead | 1,825 |
+| Call me Later | 1,436 |
+| Requirement Gathering (Warm) | 667 |
+| Does not want AI | 612 |
+| SaaS | 567 |
+| B2B-Disqualified | 543 |
+| Not Active After First Conversation | 356 |
+| RNR | 276 |
+| Payment Received | 193 |
+| Conversation In Progress (Hot) | 147 |
+| Supply Issue | 103 |
+| Retargetedlead | 92 |
+| **`Not Interested`** (undocumented) | **86** |
+| **`Requirement Gathering`** (no "(Warm)", undocumented) | **12** |
+| FB Lead - Website | 10 |
+| ReQualified By WhatsApp | 7 |
+| **`Contract Follow Up`** (undocumented) | **6** |
+| Conflict | 4 |
+
+`RetargetedleadEMAIL` exists in the dropdown but holds **0 records**.
+
+### The string-mismatch bug this exposed — 20,076 leads silently skipped
+
+`backfill-call-disposition-disqualification.ps1` (Phase 5, run 2026-07-27) probed
+`Invalid/Junk` and `Just Enquiring No Intent`. Both returned **0 leads**, and the run logged
+that as fact. The real strings are `Invalid/ Junk` and `Just Enquiring, No Intent` — so
+**17,340 + 2,736 = 20,076 leads never got `mx_Disqualification_Reason` backfilled**. The
+three undocumented values (104 leads) were never in the mapping at all.
+
+This is exactly the failure mode `CLAUDE.md` warns about — a zero-row result believed
+without a negative control. The rule has to be applied to *zero* results too, not just
+suspicious non-zero ones. **Lesson: enumerate actual stored values; never probe a list of
+guessed strings.** A paginated tally that reconciles to the known record total is the only
+trustworthy way to enumerate a dropdown's real contents.
+
+**Superseded**: the 4-way split previously sketched here is replaced by the locked design in
+`docs/STAGE_RESTRUCTURE_PLAN.md` (Contact: Fresh/Engaged/Prospect/Customer/Disqualified).
 
 ## Data quality flags
 

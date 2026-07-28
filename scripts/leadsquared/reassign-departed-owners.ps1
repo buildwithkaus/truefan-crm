@@ -7,7 +7,7 @@
   and reassigns OwnerId to Admin for every record.
 
   Leads   -> LeadManagement.svc/Lead/Bulk/UpdateV2 (25 records/call, ~1 call/sec pacing)
-  Companies -> CompanyManagement.svc/Company.Update (single record/call — the bulk Company
+  Companies -> CompanyManagement.svc/Company.Update (single record/call - the bulk Company
                endpoint only matches by CompanyName and is create-OR-update, which risks
                silently creating a duplicate company on any name mismatch. Not worth the risk
                when we already have exact CompanyId for every record.)
@@ -60,7 +60,7 @@ function Reassign-Leads {
             if ($resp.Status.FailureCount -gt 0) { Write-Log "Batch $b : FAILURES -> $($resp | ConvertTo-Json -Depth 5 -Compress)" }
         } catch {
             $failTotal += $chunk.Count
-            Write-Log "Batch $b : EXCEPTION -> $($_.ErrorDetails.Message)"
+            Write-Log "Batch $b : EXCEPTION -> $($_.Exception.Message) | HTTP: $($_.ErrorDetails.Message)"
         }
         if ($b % 20 -eq 0) { Write-Log "Lead progress: batch $b/$batches  success=$successTotal fail=$failTotal" }
         Start-Sleep -Milliseconds 1100   # stay under bulk rate limit (5 calls/5s)
@@ -83,7 +83,7 @@ function Reassign-Companies {
             if ($resp.Status -eq "Success") { $successTotal++ } else { $failTotal++; Write-Log "Company $($c.CompanyId): unexpected response $($resp | ConvertTo-Json -Compress)" }
         } catch {
             $failTotal++
-            Write-Log "Company $($c.CompanyId): EXCEPTION -> $($_.ErrorDetails.Message)"
+            Write-Log "Company $($c.CompanyId): EXCEPTION -> $($_.Exception.Message) | HTTP: $($_.ErrorDetails.Message)"
         }
         if ($i % 200 -eq 0) { Write-Log "Company progress: $i/$($companies.Count)  success=$successTotal fail=$failTotal" }
         Start-Sleep -Milliseconds 400

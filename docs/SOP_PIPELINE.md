@@ -1,0 +1,214 @@
+# SOP — How You Work Your Pipeline
+
+For: TrueFan sales reps. Effective from the changeover date announced in your briefing.
+Questions: Kaustubh Chauhan (Founder's Office).
+
+---
+
+## What changed, in one paragraph
+
+You used to record everything in one field — **Lead Stage** — which had 28 options mixing
+three unrelated things: what happened on your last call, why a lead was dead, and how far
+along the relationship was. From now on the Lead Stage has **five** options and does one job:
+it says how far along the relationship is. What happened on the call, and why a lead is dead,
+move to their own fields.
+
+The practical effect: a lead who did not pick up the phone no longer looks the same as a lead
+who told you no. About **17,000 leads** were sitting in that confusion — they looked dead, but
+they were only un-dialled. Those are coming back into your queues.
+
+---
+
+## The five contact stages
+
+```
+Fresh  ->  Engaged  ->  Prospect  ->  Customer
+                    \
+                     ->  Disqualified (reason required)
+```
+
+| Stage | Means |
+|---|---|
+| **Fresh** | You have never had a live conversation with this person. Includes every un-connected dial. |
+| **Engaged** | You reached a human. Conversation is happening. No firm requirement yet. |
+| **Prospect** | There is a real deal here. A deal record gets created automatically. |
+| **Customer** | Payment received. |
+| **Disqualified** | Out of play. **Reason is mandatory.** |
+
+**You own this field.** Two of the moves happen for you; one is your judgement call.
+
+---
+
+## Part 1 — Fresh to Engaged happens automatically
+
+The first time you log **any** activity against a contact — a call, an email, a WhatsApp,
+anything — the system moves them from `Fresh` to `Engaged` on its own. Their company moves
+from `Fresh` to `Nurture` at the same time.
+
+You do not need to do anything. Just **log the activity**.
+
+This works in one direction only. Once a contact is a `Prospect`, logging another call will
+never drag them back to `Engaged`.
+
+### Still log the call outcome properly
+
+Every call gets an activity with an outcome. If it is not logged, it did not happen, and the
+contact drops out of your follow-up queue.
+
+**Not Connected** -> pick the reason: Switched Off, Not Reachable, Wrong Number/Junk, RNR,
+Did not pick.
+
+> Important: **not reaching someone is not a rejection.** They stay in your queue with a
+> callback date. Do not disqualify a lead just because they did not answer.
+
+**Connected** -> record what came of it, and set your Next Step and follow-up date.
+
+---
+
+## Part 2 — Engaged to Prospect is YOUR call
+
+This is the one move you make by hand, and it is the most important decision in the system.
+
+> **When you judge there is a real deal here, set the Contact Stage to `Prospect`.**
+
+There is deliberately no automatic trigger for this. No single call outcome reliably means
+"this is a real deal now" — so it is your judgement, not a dropdown's.
+
+Move to `Prospect` when the brand has told you what they actually want: they are looking for
+an endorsement, broadly okay with base pricing, and there is a real campaign in view. Anything
+softer than that is still `Engaged`.
+
+The moment you set it, the system automatically:
+
+- makes you the **primary contact** for that account
+- **creates the Opportunity** at stage `Prospect`
+- moves the **company** from `Nurture` to `Opportunity`
+
+You never create a deal by hand. You never edit the company stage. You make one judgement call
+and the pipeline builds itself.
+
+---
+
+## Part 3 — Working the deal
+
+Once the Opportunity exists, you drive **the Opportunity Stage**. The contact and company
+follow it automatically.
+
+| Stage | Move it here when |
+|---|---|
+| **Prospect** | Requirement gathered, nothing proposed yet. *(Set for you automatically.)* |
+| **In Discussion** | Actively working celebrity / product / pricing with them. |
+| **Agreement Sent** | Contract has gone to the client. |
+| **Invoice Sent** | Proforma invoice raised. |
+| **Payment Received** | Payment has landed. **The contact and company become `Customer` at this point.** |
+| **Customer** | Contract fully active, delivery underway. |
+
+### Agreement and Invoice in either order
+
+Sometimes the contract goes first, sometimes the PI does. Both are fine. Two rules:
+
+1. **Always stamp the date field** for whichever you sent — `Agreement Sent Date` or
+   `Invoice Sent Date`. Both get filled in eventually, in whatever order they happen.
+2. **The Stage only ever moves forward.** If you invoiced first, set Stage = `Invoice Sent`.
+   When the agreement follows, stamp `Agreement Sent Date` but **leave the Stage alone** — it
+   is already further along.
+
+A deal never moves backwards. If something falls through, that is a Lost outcome with a
+reason, not a downgrade.
+
+### Payments in instalments
+
+A contract may be collected across several payments as deliverables ship. Log each one as it
+lands with `Amount Received`, `Total Amount` and `Pending Amount`. Keep `Total Amount` as the
+**full contract value on every entry** so Pending stays correct. You are not responsible for
+delivery — you are responsible for the collection record being true.
+
+---
+
+## Part 4 — Disqualifying properly
+
+You must give a reason. Pick the **category** first — it decides whether we ever come back:
+
+| Category | Use when | What happens to the account |
+|---|---|---|
+| **Not ICP Fit** | They will never want this — wrong business type entirely (B2B software, not a real business, no interest in celebrity endorsement in any form) | Closed off. Not worked again. |
+| **No Requirement** | Right kind of business, no need right now | Comes back on a revisit date |
+| **Commercial Mismatch** | They want it, the price does not work | Comes back if pricing changes |
+| **Supply Gap** | They want it, our celebrity list does not cover it | **Comes back the moment we sign a relevant celebrity** |
+| **Unreachable / Bad Data** | Wrong number or bad details — but the business is real and qualified | Account stays open, flagged to find a better contact |
+| **Not Interested** | Heard the pitch, said no | Comes back at low priority |
+
+Then pick the specific reason underneath it.
+
+**Be honest with the category.** "Not ICP Fit" is permanent — it removes the account from
+everyone's list for good. If they merely have no budget this quarter, that is Commercial
+Mismatch, and it comes back to you.
+
+### The one that pays you back
+
+`Supply Gap` and `Commercial Mismatch` are the closest thing to free pipeline you have. Every
+new celebrity we sign and every pricing change turns some of those accounts live again, with
+no prospecting. That only works if you tagged them correctly on the way out.
+
+---
+
+## Part 5 — Accounts with several contacts
+
+If you are working at account level, one company can have several people in it.
+
+- Only **one contact per account owns the deal** — the primary contact. That is whoever you
+  first moved to `Prospect`. The system sets it.
+- Other contacts at the same account are **stakeholders**. Work them, log calls, move them to
+  `Engaged` — but they do not each get their own deal.
+- If a second person at an account reaches deal stage while a deal is already open, **do not
+  open a second deal.** Add them as a stakeholder, or ask for the primary contact to be
+  switched if they are the real decision-maker.
+
+Five people at one company is not five opportunities. It is one opportunity with five people
+in the buying committee — a stronger deal, not a bigger number.
+
+> **During the transition month:** half the team is working at account level and half is
+> continuing the current contact-by-contact process. If you are in the second group, keep
+> working exactly as you do today — just use the five new stages. The company and deal records
+> build themselves underneath you, so when you switch over, your accounts are already set up.
+> You do not need to go back and redo anything.
+
+---
+
+## Quick reference
+
+**Log every activity.** First one moves the contact to `Engaged` automatically.
+
+**`Fresh` -> `Engaged`** — automatic, on first activity.
+
+**`Engaged` -> `Prospect`** — **your judgement call.** Set it when there is a real deal.
+Creates the Opportunity and moves the company for you.
+
+**After that** — drive the Opportunity Stage only. Stamp Agreement/Invoice dates whenever they
+happen, in any order. Stage only moves forward.
+
+**Payment Received = Customer.** Contact and company both flip automatically.
+
+**Disqualifying** — category first, then reason. "Not ICP Fit" is permanent; use it carefully.
+
+**Not reached is not rejected.** RNR, did not pick and switched off keep a lead `Fresh` and in
+your queue.
+
+**One account, one deal.**
+
+---
+
+## What you should stop doing
+
+- Using stage values as call outcomes ("Didn't Picked", "RNR", "Follow Up") — those are now
+  the call's own fields.
+- Using stage values as reasons ("Low Budget", "Supply Issue", "Conflict") — those are now the
+  Disqualification Reason.
+- Editing the company stage by hand. It follows your contact stage.
+- Creating deals manually. Moving a contact to `Prospect` does it.
+- Keeping your pipeline in a personal sheet. If the CRM does not show your pipeline correctly
+  after this change, that is a bug worth reporting — not a reason to rebuild the sheet.
+
+That last one matters. The sheets exist because the CRM could not answer "what is my account
+list and where does each one stand." It can now. If it cannot for your book, say so, and it
+gets fixed.

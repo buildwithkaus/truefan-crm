@@ -25,7 +25,46 @@ mapping" step from the Outreach Model email plugs into the data model.
   Opportunity Types > Create). No API found. `GetOpportunityTypeMetadata` only reads an
   existing type by its `code` — can't be used to discover types that don't exist yet.
 
-## Proposed Opportunity Stage (Open) / Loss Reason (Lost) design
+## Opportunity Type — built 2026-07-27, Stage dropdown corrected in UI (re-verified live 2026-07-28)
+
+`GetOpportunityTypes` / `GetOpportunityTypeMetadata?code=12000` confirms a Type exists
+(`EventCode 12000`, `DisplayName "Opportunity"`, modified by Kaustubh Chauhan).
+
+**Critical structural finding (2026-07-28): "Stage" is NOT the native LSQ stage construct —
+it is a custom field, `mx_Custom_2`, a SearchableDropdown with `ParentField = "Status"`.**
+The native `Status` field is displayed to reps as **"Deal Stage"** and holds the fixed
+Open/Won/Lost values. Anything reading or writing opportunity stage must target
+`mx_Custom_2`, not `Status`. `scripts/leadsquared/resume-opportunity-backfill.ps1` already
+does this correctly.
+
+**The Phase 3 blocker recorded in `PROJECT_PLAN.md` was already resolved** — the UI edit was
+done and the generic template values (Prospecting/Qualification/Need Analysis/...) are gone.
+As-built and verified live 2026-07-28:
+
+| Status | `mx_Custom_2` Stage values |
+|---|---|
+| Open | Requirement Gathering, Celebrity/Product Proposed, Contract Sent, Payment Pending |
+| Won | Payment Recieved *(sic — typo in the live value)* |
+| Lost | Closed - Lost |
+
+**Renames are supported and tracked in place.** The Won option carries
+`"Value":"Payment Recieved","OldValue":"Closed - Won"` — proof that a dropdown value can be
+renamed rather than recreated. This is the basis of the cheap-migration path in
+`docs/STAGE_RESTRUCTURE_PLAN.md` section 7.1 (rename buckets whose entire population maps to
+one new value; write only the deltas). **Whether a rename carries existing records' stored
+values is still unverified — test on a throwaway field before depending on it.**
+
+Under the 2026-07-28 locked design these five values are renamed to: Prospect, In Discussion,
+Agreement Sent, Invoice Sent, Payment Received (typo fixed), plus a new Won value `Customer`.
+
+Confirmed built custom fields (schema name → display name): `mx_Custom_1` → Opportunity Name
+(mandatory), `mx_Custom_2` → Stage (mandatory, dependent on Status), `mx_Custom_10` → Product,
+`mx_Custom_13` → Celebrity Assigned, `mx_Custom_14`/`mx_Custom_15` → Contract Start/End
+Date, `mx_Custom_4` → Loss Reason, `mx_Custom_12` → Renewed From, `mx_Custom_6`/`mx_Custom_7`
+→ Expected/Actual Deal Size, `mx_Custom_8`/`mx_Custom_9` → Expected/Actual Closure Date.
+
+## Proposed Opportunity Stage (Open) / Loss Reason (Lost) design (original proposal — see
+note above on what was actually built)
 
 - Open: Requirement Gathering → Celebrity/Product Proposed → Contract Sent → Payment
   Pending
@@ -37,7 +76,7 @@ mapping" step from the Outreach Model email plugs into the data model.
   of the original. This was an open question in the Pipeline Centralization email;
   resolved this way so renewal rate and new-logo rate stay separately reportable.
 
-## Proposed new Opportunity fields (beyond platform defaults)
+## Proposed new Opportunity fields (beyond platform defaults) — all confirmed built
 
 | Field | Type | Source |
 |---|---|---|
