@@ -49,7 +49,16 @@ $work = Get-Content $worklistPath -Raw | ConvertFrom-Json
 Write-LsqLog "Worklist rows: $($work.Count)" $logPath
 
 # Skip rows that are already correct - makes the run idempotent and much cheaper on re-run.
-$pending = @($work | Where-Object { $_.OldStage -ne $_.NewContactStage })
+# A row needs writing if the STAGE changes OR if it carries any mapped field, because this same
+# write also sets reason/category/disposition/segment/resourcing. Filtering on the stage alone
+# was wrong: the legacy value "Disqualified" maps to the new value "Disqualified" - the same
+# string - so 25,520 leads were classed "already correct", skipped, and never received their
+# disqualification reason or category. Caught by 07-verify on 2026-07-31, fixed by
+# 04c-fill-mapped-field-gaps.ps1.
+$pending = @($work | Where-Object {
+    $_.OldStage -ne $_.NewContactStage -or
+    $_.Reason -or $_.Category -or $_.Disposition -or $_.Segment -or $_.NeedsContactResourcing
+})
 $alreadyCorrect = $work.Count - $pending.Count
 Write-LsqLog "Already at target stage (skipped): $alreadyCorrect" $logPath
 Write-LsqLog "Rows needing a write: $($pending.Count)" $logPath
@@ -75,28 +84,42 @@ if (Test-Path $checkpointPath) {
 $url = Get-LsqUrl "LeadManagement.svc/Lead/Bulk/UpdateV2"
 $okCount = 0; $failCount = 0
 
+function ConvertTo-JsonScalar {
+    # ConvertTo-Json on a bare string returns a properly escaped, quoted JSON literal - safer
+    # than hand-rolling escapes for real lead data (quotes, backslashes, non-ASCII).
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value) { return '""' }
+    return ($Value | ConvertTo-Json)
+}
+
 for ($b = $startBatch; $b -lt $batches; $b++) {
     $slice = $pending[($b * $BatchSize)..([Math]::Min(($b + 1) * $BatchSize - 1, $pending.Count - 1))]
 
-    $records = @()
-    foreach ($row in $slice) {
-        $fields = @(
-            @{ Attribute = "ProspectId";    Value = $row.ProspectId }
-            @{ Attribute = "ProspectStage"; Value = $row.NewContactStage }
-        )
-        if ($row.Reason)      { $fields += @{ Attribute = "mx_Disqualification_Reason";   Value = $row.Reason } }
-        if ($row.Category)    { $fields += @{ Attribute = "mx_Disqualification_Category"; Value = $row.Category } }
-        if ($row.Disposition) { $fields += @{ Attribute = "mx_Call_Disposition";          Value = $row.Disposition } }
-        if ($row.Segment)     { $fields += @{ Attribute = "mx_Segment";                   Value = $row.Segment } }
-        if ($row.NeedsContactResourcing) { $fields += @{ Attribute = "mx_Needs_Contact_Resourcing"; Value = "Yes" } }
-        $records += ,@(@{ Fields = $fields })
+    # LeadPropertiesList is an array of OBJECTS - [{ "Fields": [ {Attribute,Value}, ... ] }, ...].
+    # It was previously built as an array of ARRAYS (",@(@{Fields=...})"), which the API rejects
+    # outright: 400 "Cannot deserialize the current JSON array into type LeadFieldKeyValuePair".
+    # That failed 100% of batches on 2026-07-30 (nothing was written - a 400 rejects the whole
+    # batch). The shape below matches backfill-call-disposition-disqualification.ps1, which is
+    # the version that actually ran live successfully.
+    #
+    # Built as explicit JSON text rather than ConvertTo-Json on a PS array, because PowerShell
+    # 5.1 collapses a SINGLE-element array into a bare object - which would silently malform the
+    # final batch whenever the record count is not an exact multiple of 25. See CLAUDE.md.
+    $recJson = foreach ($row in $slice) {
+        $fields = New-Object System.Collections.Generic.List[string]
+        [void]$fields.Add('{"Attribute":"ProspectId","Value":'    + (ConvertTo-JsonScalar "$($row.ProspectId)") + '}')
+        [void]$fields.Add('{"Attribute":"ProspectStage","Value":' + (ConvertTo-JsonScalar "$($row.NewContactStage)") + '}')
+        if ($row.Reason)      { [void]$fields.Add('{"Attribute":"mx_Disqualification_Reason","Value":'   + (ConvertTo-JsonScalar "$($row.Reason)") + '}') }
+        if ($row.Category)    { [void]$fields.Add('{"Attribute":"mx_Disqualification_Category","Value":' + (ConvertTo-JsonScalar "$($row.Category)") + '}') }
+        if ($row.Disposition) { [void]$fields.Add('{"Attribute":"mx_Call_Disposition","Value":'          + (ConvertTo-JsonScalar "$($row.Disposition)") + '}') }
+        if ($row.Segment)     { [void]$fields.Add('{"Attribute":"mx_Segment","Value":'                   + (ConvertTo-JsonScalar "$($row.Segment)") + '}') }
+        if ($row.NeedsContactResourcing) { [void]$fields.Add('{"Attribute":"mx_Needs_Contact_Resourcing","Value":"Yes"}') }
+        '{"Fields":[' + ($fields -join ',') + ']}'
     }
 
-    $body = @{
-        SearchByKey        = "ProspectId"
-        Options            = @{ PushNonExistentLeadsToUnProcessedList = $true }
-        LeadPropertiesList = $records
-    } | ConvertTo-Json -Depth 8
+    $body = '{"SearchByKey":"ProspectId",' +
+            '"Options":{"PushNonExistentLeadsToUnProcessedList":true},' +
+            '"LeadPropertiesList":[' + (@($recJson) -join ',') + ']}'
 
     try {
         # UTF-8 byte body: lead/company text can contain non-ASCII which the plain string

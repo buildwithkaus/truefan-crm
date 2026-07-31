@@ -146,6 +146,69 @@ was a real bug in this repo's own migration code, caught on 2026-07-28 before it
 have let a second Opportunity attach to a different contact at an account that already had
 one. Use `Test-LsqTrue` in `common.ps1` for reads.
 
+**Seventh gotcha — `CompanyManagement.svc/Company.Update` requires the property array wrapped
+in a `CompanyProperties` key; a bare array is rejected.** `[{"Attribute":"Stage","Value":"X"}]`
+returns `MXInvalidDataTypeException: "You're missing Company details."` on **every** call,
+including writing a company's own pre-existing value back to itself — the error looks like a
+dropdown/data problem but is actually a body-shape problem. The correct shape is
+`{"CompanyProperties":[{"Attribute":"Stage","Value":"X"}]}`. `apply-company-enrichment.ps1`
+and `reassign-departed-owners.ps1` had this right (both ran live successfully); found
+2026-07-29 because `05-migrate-companies.ps1`, `08-rollback.ps1`, and `sync-engine.ps1` all had
+it wrong — the bare-array form was never caught because none of those three had been run
+against production yet. Would have failed the entire company-writing leg of the migration
+*and* the rollback safety net at the same time. All three fixed and the fixed shape live-tested
+(write + independent re-fetch) before trusting it.
+
+**Eighth gotcha - a paginated page can arrive nested one level deeper, and `.Count` then reads
+`1`.** `Invoke-RestMethod` intermittently returns a `Leads.Get` page as `Object[1]` wrapping the
+real `Object[1000]` instead of a flat array, for byte-identical requests. Every paginating loop
+in this repo is shaped `if ($resp.Count -lt 1000) { break }`, so the nested shape reads "1 record,
+fewer than PageSize, stop" and the script reports a **complete scan of the whole account after one
+page**. It is decided **per-process**: a process that gets the nested shape gets it on *every*
+call, and a process that gets the flat shape never sees it. That per-process stickiness is what
+makes it so misleading - isolated health-check scripts pass 40/40 while the real script fails
+identically every run, which reads exactly like an intermittent account/API outage. It was
+misdiagnosed as one (a real billing-related access restriction had occurred separately, which
+made the wrong explanation fit). Diagnosed 2026-07-29 by noticing that a "1-row" response held a
+field whose value stringified to ~1000 space-separated values - the data was always there, only
+the shape was wrong. Fix: `Expand-LsqRows` in `common.ps1` normalizes both shapes; wrap every page
+fetch in it. Note `return $out.ToArray()` there deliberately has **no** leading comma - `return ,
+$arr` would suppress unrolling and make `@(Expand-LsqRows ...)` read `1` again, reintroducing the
+exact bug. Applied to `02-build-worklist`, `03-backup`, `06b`, `07-verify`, `08-rollback`; the
+`sync/` and `build-*` scripts still need it.
+
+**Corollary - an internal-consistency check is not a reconciliation.** `02-build-worklist.ps1`
+verified `$sum -eq $total` and logged "Reconciliation OK", which a truncated scan passes trivially
+(`1 == 1`). A guard must compare against an **absolute expected size** from an independent source
+(memory/01: 86,628 leads), not against another number derived from the same bad read. Absolute
+guards are now in `02-build-worklist` (worklist), `03-backup` (refuses to write a partial backup -
+it is the only thing `08-rollback` can restore from) and `08-rollback` (refuses to compute a delta
+from a short read).
+
+**Ninth gotcha - LSQ stores a dropdown value that is not in the dropdown instead of rejecting
+it.** Writing `mx_Disqualification_Reason = "Invalid / Not a Business"` succeeds even when that
+string is not one of the field's options, and reading it back returns it correctly - so every
+verification this repo does would pass. But the value is not selectable by a rep and a dropdown
+filter will never offer it, which makes the records **invisible to the people the field exists
+for**. Nothing in a write log reveals it. Hit twice on 2026-07-31 - Call Disposition (3 plan names
+that were never options) and Disqualification Reason (**9 options vs 12 stored values, zero
+overlap, 61,919 leads unfilterable**) - and **both were found by Kaustubh trying to filter, not by
+any check here.** Verifying a value is *correct* is not verifying it is *selectable*. Run
+`16-verify-dropdown-coverage.ps1` (checks all six Lead dropdowns at once) after anything that
+writes a dropdown field; checking one field by hand is how the second instance survived the fix
+for the first. Note the repair is not always "fix the data" - if the existing option list cannot
+express the new values, extend the dropdown instead. `CreateLeadField` rejects option values
+containing `(`, `)`, `/`, `-`, `'` or `,` ("Only alphanumeric characters, space, underscore is
+allowed"), so punctuated options must be added in the UI.
+
+**Tenth gotcha - native LSQ automations do not appear to fire on API/bulk writes.** A live
+automation (Company `Fresh`->`Nurture` on Contact `Fresh`->`Engaged`) did not react to 17,011
+leads moved via `Lead/Bulk/UpdateV2`: the backlog went **5,115 -> 5,111 over 19 minutes**, which
+is ordinary rep clicking, not an async queue draining. Treat automations as covering **UI edits
+only** until the SPOC confirms otherwise. Two consequences: pair every bulk write with a
+reconciler run, and never conclude an automation worked without measuring the backlog before and
+after with a delayed re-check - "hasn't fired yet" and "never will" look identical at a glance.
+
 **No bulk Opportunity read endpoint exists.** Probed eight candidate names on 2026-07-28; all
 404 except per-lead access (`GetOpportunitiesOfLead?leadId=X&opportunityType=12000`, where
 `opportunityType` is **required** despite the docs implying otherwise, and
@@ -217,4 +280,8 @@ for rotation to whoever owns the LeadSquared account. Treat as sensitive regardl
 4. Contacts/Lead object changes: additive only, flag for human review before anything that
    touches a field/picklist reps currently use.
 5. Log migrations to `data/*_log.txt` (gitignored) so there's an audit trail independent of
-   LeadSquared's own history.
+   LeadSquared's own history. **Do not `tail -f` one of these logs while the script is
+   running** - on Windows the reader holds the file open, every `Add-Content` in `Write-LsqLog`
+   then fails with "being used by another process", and the script keeps running with console
+   output intact but **no audit trail on disk**. It is a non-terminating error, so the run looks
+   fine. To watch progress, read the background task's own output file instead.

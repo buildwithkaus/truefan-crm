@@ -45,17 +45,23 @@ Write-LsqLog "=== Worklist build started (READ-ONLY) ===" $logPath
 # Step 1: enumerate every lead
 # ---------------------------------------------------------------------------------------
 
-$leads = @()
+# List, not @(). PowerShell arrays are immutable: "$arr += x" reallocates and copies the ENTIRE
+# array every time, so appending 86,628 leads one at a time is O(n^2) and costs many minutes of
+# pure CPU with the API sitting idle. List[object].Add() is amortised O(1).
+$leads = New-Object System.Collections.Generic.List[object]
 $valueCounts = @{}
 $page = 1
 $total = 0
 
 Write-LsqLog "Paginating all leads..." $logPath
 while ($true) {
-    $resp = Invoke-LsqLeadSearch `
+    # Expand-LsqRows: a nested page reads .Count = 1, ending this loop after one page and
+    # producing a worklist covering a single lead - which the whole migration then runs from.
+    # See common.ps1.
+    $resp = @(Expand-LsqRows (Invoke-LsqLeadSearch `
         -Filter @{ LookupName = "CreatedOn"; LookupValue = "2000-01-01"; SqlOperator = ">" } `
         -ColumnsCsv "ProspectID,ProspectStage,RelatedCompanyId,OwnerId,OwnerIdName,IsPrimaryContact,ProspectActivityDate_Max" `
-        -SortColumn "CreatedOn" -SortDirection "1" -PageIndex $page -PageSize 1000
+        -SortColumn "CreatedOn" -SortDirection "1" -PageIndex $page -PageSize 1000))
     if (-not $resp -or $resp.Count -eq 0) { break }
 
     foreach ($l in $resp) {
@@ -64,7 +70,7 @@ while ($true) {
         if ([string]::IsNullOrWhiteSpace($stage)) { $stage = "<BLANK>" }
         if ($valueCounts.ContainsKey($stage)) { $valueCounts[$stage]++ } else { $valueCounts[$stage] = 1 }
 
-        $leads += [pscustomobject]@{
+        [void]$leads.Add([pscustomobject]@{
             ProspectId       = $l.ProspectID
             OldStage         = $stage
             CompanyId        = $l.RelatedCompanyId
@@ -74,7 +80,7 @@ while ($true) {
             # $true/"true" here would mark all 4,404 real primary contacts as non-primary.
             IsPrimaryContact = (Test-LsqTrue $l.IsPrimaryContact)
             LastActivity     = $l.ProspectActivityDate_Max
-        }
+        })
     }
     if ($resp.Count -lt 1000) { break }
     $page++
@@ -87,6 +93,15 @@ Write-LsqLog "Distinct ProspectStage values found: $($valueCounts.Count)" $logPa
 # ---------------------------------------------------------------------------------------
 # Step 2: reconcile, then assert the map covers every live value. ABORT if not.
 # ---------------------------------------------------------------------------------------
+
+# Absolute-size guard FIRST. The $sum -eq $total check below only proves internal consistency,
+# which a truncated scan passes trivially (1 == 1) - it cannot tell a complete enumeration from
+# a one-page one. memory/01 puts the account at 86,628 leads (2026-07-28).
+$MinExpectedLeads = 80000
+if ($total -lt $MinExpectedLeads) {
+    Write-LsqLog "FATAL: only $total leads enumerated, expected ~86628." $logPath
+    throw "Lead enumeration returned $total leads, far short of the ~86628 in the account. Refusing to build a migration worklist from an incomplete scan. Re-run; if it repeats, stop and investigate before migrating."
+}
 
 $sum = 0
 foreach ($k in $valueCounts.Keys) { $sum += $valueCounts[$k] }
@@ -112,7 +127,7 @@ Write-LsqLog "Map completeness OK - every live value has a mapping." $logPath
 # Step 3: resolve each lead's target stage
 # ---------------------------------------------------------------------------------------
 
-$leadWork = @()
+$leadWork = New-Object System.Collections.Generic.List[object]   # see the $leads note above
 foreach ($lead in $leads) {
     $m = Get-StageMapping -OldValue $lead.OldStage
     $contact = $null; $company = $null; $oppStage = $null
@@ -131,7 +146,7 @@ foreach ($lead in $leads) {
         $oppStage = $m.OppStage
     }
 
-    $leadWork += [pscustomobject]@{
+    [void]$leadWork.Add([pscustomobject]@{
         ProspectId             = $lead.ProspectId
         CompanyId              = $lead.CompanyId
         OwnerId                = $lead.OwnerId
@@ -147,7 +162,7 @@ foreach ($lead in $leads) {
         NeedsContactResourcing = [bool]$m.NeedsContactResourcing
         IsPrimaryContact       = $lead.IsPrimaryContact
         LastActivity           = $lead.LastActivity
-    }
+    })
 }
 
 $byNew = $leadWork | Group-Object NewContactStage | Sort-Object Count -Descending
@@ -166,9 +181,10 @@ $companyRank = @{ "Customer" = 5; "Opportunity" = 4; "Nurture" = 3; "Fresh" = 2;
 $noCompany = ($leadWork | Where-Object { [string]::IsNullOrWhiteSpace($_.CompanyId) }).Count
 Write-LsqLog "Leads with no RelatedCompanyId (cannot drive a company stage): $noCompany" $logPath
 
-$companyWork = @()
-$oppWork = @()
-$collisions = @()
+# Lists, not @() - $companyWork alone appends ~71,467 times. See the $leads note above.
+$companyWork = New-Object System.Collections.Generic.List[object]
+$oppWork     = New-Object System.Collections.Generic.List[object]
+$collisions  = New-Object System.Collections.Generic.List[object]
 
 $grouped = $leadWork | Where-Object { -not [string]::IsNullOrWhiteSpace($_.CompanyId) } | Group-Object CompanyId
 Write-LsqLog "Distinct companies represented: $($grouped.Count)" $logPath
@@ -189,13 +205,13 @@ foreach ($g in $grouped) {
         }
 
         if ($prospects.Count -gt 1) {
-            $collisions += [pscustomobject]@{
+            [void]$collisions.Add([pscustomobject]@{
                 CompanyId       = $g.Name
                 ChosenPrimary   = $primary.ProspectId
                 OtherProspects  = @($prospects | Where-Object { $_.ProspectId -ne $primary.ProspectId } | ForEach-Object { $_.ProspectId })
                 Count           = $prospects.Count
                 Note            = "Several contacts at this account map to a deal stage. One opportunity created on the chosen primary; the others are flagged for rep review (add as stakeholder or transfer primary)."
-            }
+            })
         }
     }
 
@@ -213,7 +229,7 @@ foreach ($g in $grouped) {
 
     $needsResourcing = ($members | Where-Object { $_.NeedsContactResourcing }).Count -gt 0 -and $targetStage -eq "Nurture"
 
-    $companyWork += [pscustomobject]@{
+    [void]$companyWork.Add([pscustomobject]@{
         CompanyId              = $g.Name
         NewStage               = $targetStage
         FutureProspectReason   = if ($targetStage -eq "Future Prospect") { $category } else { $null }
@@ -221,17 +237,17 @@ foreach ($g in $grouped) {
         NeedsContactResourcing = $needsResourcing
         PrimaryContactId       = if ($primary) { $primary.ProspectId } else { $null }
         ContactCount           = $members.Count
-    }
+    })
 
     # One opportunity per account, on the primary contact only.
     if ($primary -and $primary.OppStage) {
-        $oppWork += [pscustomobject]@{
+        [void]$oppWork.Add([pscustomobject]@{
             CompanyId  = $g.Name
             ProspectId = $primary.ProspectId
             OwnerId    = $primary.OwnerId
             OppStage   = $primary.OppStage
             Status     = if ($primary.OppStage -in @("Payment Received", "Customer")) { "Won" } else { "Open" }
-        }
+        })
     }
 }
 

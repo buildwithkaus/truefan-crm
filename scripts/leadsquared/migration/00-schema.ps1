@@ -98,15 +98,33 @@ $Script:SuppressedCategories = @("Not ICP Fit")
 
 $Script:StageMap = @{
 
-    # ---- Fresh: never reached a human. A retryable call outcome is NOT a dead lead. ----
+    # Disposition values below are the EXACT live mx_Call_Disposition dropdown options, read from
+    # the schema on 2026-07-31, not invented names. A stored value that is not an option in its
+    # own dropdown cannot be selected or filtered by reps, which defeats the field.
+    #
+    # The earlier plan renamed two of these to "RNR (5+ dials)" and "Follow Up (pitch delivered)".
+    # Both were dropped (Kaustubh, 2026-07-31): the legacy data never recorded a dial count, and
+    # "Follow Up" does not establish that a pitch was delivered. Asserting either would be
+    # inventing precision the source data does not support.
+
+    # ---- Fresh: ONLY leads nobody has dialled yet. ----
+    # Changed 2026-07-31 (Kaustubh). Originally the three un-connected outcomes below mapped to
+    # Fresh, on the logic that no human was ever reached. Operationally that broke the bucket
+    # reps depend on: "Fresh" is where they hunt for new accounts to call, and 17,019 leads they
+    # had already dialled repeatedly were sitting in it. Fresh now means "not yet dialled"; a
+    # dialled-but-unconnected lead is work in progress, so it sits in Engaged with the reason it
+    # did not connect recorded in Call Disposition.
+    #
+    # Known trade-off, accepted: Engaged no longer means "reached a human" - roughly 79% of it
+    # will be dial-attempts. Use Call Disposition to tell the two apart.
     "Fresh Lead"                 = @{ Contact = "Fresh"; Company = "Fresh" }
-    "Didn't Picked"              = @{ Contact = "Fresh"; Company = "Fresh"; Disposition = "Did Not Pick" }
-    "RNR"                        = @{ Contact = "Fresh"; Company = "Fresh"; Disposition = "RNR (5+ dials)" }
-    "Switched Off/Not Reachable" = @{ Contact = "Fresh"; Company = "Fresh"; Disposition = "Switched Off / Not Reachable" }
+    "Didn't Picked"              = @{ Contact = "Engaged"; Company = "Nurture"; Disposition = "Did Not Pick" }
+    "RNR"                        = @{ Contact = "Engaged"; Company = "Nurture"; Disposition = "RNR" }
+    "Switched Off/Not Reachable" = @{ Contact = "Engaged"; Company = "Nurture"; Disposition = "Switched Off/Not Reachable" }
 
     # ---- Engaged: reached a human, no requirement stated yet ----
-    "Call me Later"           = @{ Contact = "Engaged"; Company = "Nurture"; Disposition = "Call Me Later" }
-    "Follow Up"               = @{ Contact = "Engaged"; Company = "Nurture"; Disposition = "Follow Up (pitch delivered)" }
+    "Call me Later"           = @{ Contact = "Engaged"; Company = "Nurture"; Disposition = "Call me Later" }
+    "Follow Up"               = @{ Contact = "Engaged"; Company = "Nurture"; Disposition = "Follow Up" }
     "ReQualified By WhatsApp" = @{ Contact = "Engaged"; Company = "Nurture"; Segment = "WhatsApp Requalified" }
     "Retargetedlead"          = @{ Contact = "Engaged"; Company = "Nurture"; Segment = "Retargeted (WhatsApp)" }
     "RetargetedleadEMAIL"     = @{ Contact = "Engaged"; Company = "Nurture"; Segment = "Retargeted (Email)" }

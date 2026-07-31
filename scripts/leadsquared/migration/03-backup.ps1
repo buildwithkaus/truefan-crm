@@ -28,28 +28,66 @@ $logPath = Join-Path $dataDir "migration_backup_log.txt"
 
 Write-LsqLog "=== Backup started (READ-ONLY) stamp=$stamp ===" $logPath
 
+# A FAILED request must never be mistaken for "end of data". These loops stop when a page comes
+# back short or empty, so a transient network error - which returns nothing - silently ends the
+# backup early and looks exactly like a clean finish. Hit live 2026-07-29: a DNS failure at page
+# 25 ended the run at 25,000 leads. The size guard below caught that one, but a blip at page 85
+# would have yielded ~85,000 - over the 80,000 threshold - and written a silently incomplete
+# backup that passed every check. So: retry, and if a page genuinely cannot be fetched, ABORT
+# the whole backup rather than return a short one.
+function Get-LeadPageOrThrow {
+    param([int]$PageIndex, [int]$MaxAttempts = 5)
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $failure = $null
+        $result = $null
+        try {
+            # Expand-LsqRows: the page can also arrive nested one level deeper, where .Count
+            # reads 1 - same silent-undercount family. See common.ps1.
+            $result = Invoke-LsqLeadSearch -ErrorAction Stop `
+                -Filter @{ LookupName = "CreatedOn"; LookupValue = "2000-01-01"; SqlOperator = ">" } `
+                -ColumnsCsv "ProspectID,ProspectStage,mx_Call_Disposition,mx_Disqualification_Reason,IsPrimaryContact,RelatedCompanyId" `
+                -SortColumn "CreatedOn" -SortDirection "1" -PageIndex $PageIndex -PageSize 1000
+        } catch {
+            $failure = $_
+        }
+        if (-not $failure) { return @(Expand-LsqRows $result) }
+        Write-LsqLog "  lead page $PageIndex attempt $attempt/$MaxAttempts FAILED -> $($failure.Exception.Message)" $logPath
+        if ($attempt -eq $MaxAttempts) {
+            throw "Backup ABORTED: lead page $PageIndex failed $MaxAttempts times (last error: $($failure.Exception.Message)). Refusing to treat a failed request as the end of the data - that would produce a short backup that looks complete."
+        }
+        Start-Sleep -Seconds ([Math]::Min(30, 5 * $attempt))
+    }
+}
+
 # --- Leads -----------------------------------------------------------------------------
-$leadBackup = @()
+# List, not @(). "$arr += x" reallocates and copies the whole array each time, so appending
+# ~87,000 leads is O(n^2) - that alone took 8 minutes of pure CPU on 2026-07-30 with the API
+# idle. List[object].Add() is amortised O(1).
+$leadBackup = New-Object System.Collections.Generic.List[object]
 $page = 1
 while ($true) {
-    $resp = Invoke-LsqLeadSearch `
-        -Filter @{ LookupName = "CreatedOn"; LookupValue = "2000-01-01"; SqlOperator = ">" } `
-        -ColumnsCsv "ProspectID,ProspectStage,mx_Call_Disposition,mx_Disqualification_Reason,IsPrimaryContact,RelatedCompanyId" `
-        -SortColumn "CreatedOn" -SortDirection "1" -PageIndex $page -PageSize 1000
+    $resp = @(Get-LeadPageOrThrow -PageIndex $page)
     if (-not $resp -or $resp.Count -eq 0) { break }
     foreach ($l in $resp) {
-        $leadBackup += [pscustomobject]@{
+        [void]$leadBackup.Add([pscustomobject]@{
             ProspectId          = $l.ProspectID
             ProspectStage       = $l.ProspectStage
             CallDisposition     = $l.mx_Call_Disposition
             DisqualificationRsn = $l.mx_Disqualification_Reason
             IsPrimaryContact    = $l.IsPrimaryContact
             CompanyId           = $l.RelatedCompanyId
-        }
+        })
     }
     if ($resp.Count -lt 1000) { break }
     $page++
     Start-Sleep -Milliseconds 250
+}
+# This backup is the ONLY thing 08-rollback can restore from, so a silently-short capture is
+# unrecoverable: the migration would proceed believing it had a safety net that covers 1 record.
+# memory/01 puts the account at 86,628 leads (2026-07-28); allow for churn, not a large shortfall.
+$MinExpectedLeads = 80000
+if ($leadBackup.Count -lt $MinExpectedLeads) {
+    throw "Lead backup captured only $($leadBackup.Count) of ~86628 expected leads. REFUSING to write a partial backup - a migration run against this file would have no usable rollback. Re-run; if it repeats, do not proceed with the migration."
 }
 $leadPath = Join-Path $dataDir "migration_BACKUP_leads_$stamp.json"
 $leadBackup | ConvertTo-Json -Depth 4 | Set-Content -Path $leadPath
@@ -58,20 +96,39 @@ Write-LsqLog "Leads backed up: $($leadBackup.Count) -> $leadPath" $logPath
 # --- Companies -------------------------------------------------------------------------
 # Company.Get's Include_CSV is picky about exact field names; fetch full records and read
 # companyPropertyList instead of guessing a column list.
-$companyBackup = @()
+function Get-CompanyPageOrThrow {
+    param([int]$PageIndex, [int]$MaxAttempts = 5)
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $failure = $null
+        $result = $null
+        try {
+            $result = Invoke-LsqCompanySearch -ErrorAction Stop -CompanyTypeName "Company" -PageIndex $PageIndex -PageSize 1000
+        } catch {
+            $failure = $_
+        }
+        if (-not $failure) { return $result }
+        Write-LsqLog "  company page $PageIndex attempt $attempt/$MaxAttempts FAILED -> $($failure.Exception.Message)" $logPath
+        if ($attempt -eq $MaxAttempts) {
+            throw "Backup ABORTED: company page $PageIndex failed $MaxAttempts times (last error: $($failure.Exception.Message)). Refusing to treat a failed request as the end of the data."
+        }
+        Start-Sleep -Seconds ([Math]::Min(30, 5 * $attempt))
+    }
+}
+
+$companyBackup = New-Object System.Collections.Generic.List[object]   # see the $leadBackup note
 $page = 1
 while ($true) {
-    $resp = Invoke-LsqCompanySearch -CompanyTypeName "Company" -PageIndex $page -PageSize 1000
+    $resp = Get-CompanyPageOrThrow -PageIndex $page
     if (-not $resp.Companies -or $resp.Companies.Count -eq 0) { break }
     foreach ($c in $resp.Companies) {
         $props = @{}
         foreach ($p in $c.companyPropertyList) { $props[$p.Attribute] = $p.Value }
-        $companyBackup += [pscustomobject]@{
+        [void]$companyBackup.Add([pscustomobject]@{
             CompanyId   = $props.CompanyId
             CompanyName = $props.CompanyName
             Stage       = $props.Stage
             OwnerName   = $props.OwnerName
-        }
+        })
     }
     if ($resp.Companies.Count -lt 1000) { break }
     $page++

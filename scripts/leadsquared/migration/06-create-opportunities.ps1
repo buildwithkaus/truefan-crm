@@ -44,7 +44,15 @@ $mode = if ($Execute) { "EXECUTE" } else { "DRY RUN" }
 Write-LsqLog "=== Opportunity creation [$mode] ===" $logPath
 
 if (-not (Test-Path $worklistPath)) { throw "Worklist missing. Run 02-build-worklist.ps1 first." }
-$work = @(Get-Content $worklistPath -Raw | ConvertFrom-Json)
+# Expand-LsqRows + shape assert: without it this collapsed 953 rows into ONE and reported
+# "Opportunities in worklist: 1" (caught in dry run 2026-07-31). The same collapse hit
+# 05-migrate-companies and 06b. A creator that silently sees one row would report a clean run
+# having created nothing.
+$work = @(Expand-LsqRows (Get-Content $worklistPath -Raw | ConvertFrom-Json))
+$badRows = @($work | Where-Object { [string]::IsNullOrWhiteSpace($_.ProspectId) -or @($_.ProspectId).Count -ne 1 })
+if ($badRows.Count -gt 0) {
+    throw "Opportunity worklist has $($badRows.Count) row(s) with a missing or non-scalar ProspectId. Refusing to create from a malformed worklist."
+}
 Write-LsqLog "Opportunities in worklist: $($work.Count)" $logPath
 
 if (-not $Execute) {
@@ -67,10 +75,37 @@ $base = $cfg['LSQ_API_HOST']; $ak = $cfg['LSQ_ACCESS_KEY']; $sk = $cfg['LSQ_SECR
 $primaryUrl = "$base/LeadManagement.svc/Lead/Bulk/UpdateV2?accessKey=$ak&secretKey=$sk"
 $captureUrl = "$base/OpportunityManagement.svc/Capture?accessKey=$ak&secretKey=$sk"
 
-$skipped = 0; $created = 0; $failed = 0; $pcOk = 0; $pcFail = 0
+# CompanyId -> CompanyName, needed for the mandatory Opportunity Name field. The worklist only
+# carries CompanyId, so this comes from the pre-migration company backup (names do not change
+# during a stage migration). A missing name would fail the create, so it is resolved up front
+# and any row without one is reported rather than attempted.
+$companyNameOf = @{}
+$compBackup = @(Get-ChildItem (Join-Path $dataDir "migration_BACKUP_companies_*.json") -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+if ($compBackup.Count -eq 0) { throw "No migration_BACKUP_companies_*.json found - needed to resolve the mandatory Opportunity Name." }
+foreach ($c in @(Expand-LsqRows (Get-Content $compBackup[0].FullName -Raw | ConvertFrom-Json))) {
+    $cid = "$($c.CompanyId)"
+    if ($cid) { $companyNameOf[$cid] = "$($c.CompanyName)" }
+}
+Write-LsqLog "Company names loaded for Opportunity Name: $($companyNameOf.Count) (from $($compBackup[0].Name))" $logPath
+$noName = @($work | Where-Object { -not $companyNameOf.ContainsKey("$($_.CompanyId)") -or [string]::IsNullOrWhiteSpace($companyNameOf["$($_.CompanyId)"]) })
+if ($noName.Count -gt 0) { Write-LsqLog "WARNING: $($noName.Count) worklist row(s) have no resolvable CompanyName - they will be skipped." $logPath }
+
+$skipped = 0; $created = 0; $failed = 0; $pcOk = 0; $pcFail = 0; $noNameSkipped = 0
 
 for ($i = $startIdx; $i -lt $work.Count; $i++) {
     $row = $work[$i]
+
+    # Opportunity Name is mandatory - without a resolvable CompanyName the create is guaranteed
+    # to fail, so skip and record rather than burn an API call and log a confusing error.
+    $companyName = ""
+    if ($companyNameOf.ContainsKey("$($row.CompanyId)")) { $companyName = $companyNameOf["$($row.CompanyId)"] }
+    if ([string]::IsNullOrWhiteSpace($companyName)) {
+        $noNameSkipped++
+        Write-LsqLog "Lead $($row.ProspectId): no CompanyName for company $($row.CompanyId) - skipping (Opportunity Name is mandatory)" $logPath
+        Set-Content -Path $checkpointPath -Value ($i + 1)
+        continue
+    }
 
     # --- 1. Check before create -------------------------------------------------------
     $checkUrl = "$base/OpportunityManagement.svc/GetOpportunitiesOfLead?accessKey=$ak&secretKey=$sk&leadId=$($row.ProspectId)&opportunityType=12000"
@@ -91,14 +126,16 @@ for ($i = $startIdx; $i -lt $work.Count; $i++) {
     }
 
     # --- 2. Flag the primary contact ---------------------------------------------------
-    $pcBody = @{
-        SearchByKey = "ProspectId"
-        Options = @{ PushNonExistentLeadsToUnProcessedList = $true }
-        LeadPropertiesList = @(, @(@{ Fields = @(
-            @{ Attribute = "ProspectId";       Value = $row.ProspectId },
-            @{ Attribute = "IsPrimaryContact"; Value = "true" }
-        ) }))
-    } | ConvertTo-Json -Depth 8
+    # LeadPropertiesList is an array of OBJECTS, not an array of arrays. The nested form here
+    # returned 400 "Cannot deserialize the current JSON array into type LeadFieldKeyValuePair"
+    # on every single record (2026-07-31) - the identical bug that failed 100% of batches in
+    # 04-migrate-leads. Built as explicit JSON so PowerShell 5.1 cannot collapse the
+    # single-element array into a bare object either.
+    $pcBody = '{"SearchByKey":"ProspectId","Options":{"PushNonExistentLeadsToUnProcessedList":true},' +
+              '"LeadPropertiesList":[{"Fields":[' +
+                  '{"Attribute":"ProspectId","Value":' + ("$($row.ProspectId)" | ConvertTo-Json) + '},' +
+                  '{"Attribute":"IsPrimaryContact","Value":"true"}' +
+              ']}]}'
     try {
         $r1 = Invoke-LsqPost -Uri $primaryUrl -JsonBody $pcBody
         if ($r1.Status.SuccessCount -gt 0) { $pcOk++ } else { $pcFail++ }
@@ -121,8 +158,14 @@ for ($i = $startIdx; $i -lt $work.Count; $i++) {
             UpdateEmptyFields         = $true
             DoNotPostDuplicateActivity = $false
             DoNotChangeOwner          = $false
+            # mx_Custom_1 is "Opportunity Name" and is MANDATORY - omitting it fails every
+            # create with MXInvalidActivityFieldsException "Field name : 'mx_Custom_1' of
+            # datatype : 'String' is mandatory." (2026-07-31). Phase 3's backfill set it to the
+            # CompanyName, so the same source is used here and the 4,404 existing Opportunities
+            # and any new ones stay consistent.
             Fields = @(
                 @{ SchemaName = "Status";      Value = $row.Status },
+                @{ SchemaName = "mx_Custom_1"; Value = $companyName },
                 @{ SchemaName = "mx_Custom_2"; Value = $row.OppStage },
                 @{ SchemaName = "Owner";       Value = $row.OwnerId }
             )
@@ -143,7 +186,7 @@ for ($i = $startIdx; $i -lt $work.Count; $i++) {
     Start-Sleep -Milliseconds $ThrottleMs
 }
 
-Write-LsqLog "Opportunity creation DONE. created=$created skipped=$skipped failed=$failed primaryContact(ok=$pcOk fail=$pcFail)" $logPath
+Write-LsqLog "Opportunity creation DONE. created=$created skipped=$skipped noName=$noNameSkipped failed=$failed primaryContact(ok=$pcOk fail=$pcFail)" $logPath
 if ($failed -eq 0) {
     Remove-Item $checkpointPath -ErrorAction SilentlyContinue
     Write-LsqLog "Checkpoint cleared (clean run)." $logPath

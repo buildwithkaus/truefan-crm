@@ -1,5 +1,31 @@
 # Open decisions — need a human call, not resolvable from data alone
 
+## Resolved by Kaustubh, 2026-07-31 — post-migration
+
+1. **`Fresh` means "nobody has dialled this yet".** The three un-connected outcomes
+   (`Didn't Picked`, `RNR`, `Switched Off/Not Reachable`) originally mapped to `Fresh` because no
+   human was ever reached. Operationally that buried the bucket reps hunt in under 17,019 leads
+   they had already chased. **Decision: move them to `Engaged`**, reason preserved in Call
+   Disposition. Executed — 17,011 leads, 0 failures. Accepted trade-off, stated explicitly:
+   `Engaged` no longer means "reached a human" (~79% of it is dial attempts).
+2. **Call Disposition keeps its six existing option names; the data is matched to them.** The plan
+   had renamed two — rejected by Kaustubh, and he was right: the legacy `RNR` value never recorded
+   a dial count, and `Follow Up` does not establish a pitch was delivered. Asserting either invents
+   precision the source data does not support. `00-schema.ps1` updated so no future run
+   reintroduces the qualifiers.
+3. **Disqualification Reason: extend the dropdown, do not revert the data.** The 9 legacy options
+   cannot express `Not Interested - No Reason Stated` (25,527) or `Invalid Contact Data` (4,797) at
+   all, so matching the data to the old list would have destroyed real distinctions. 11 canonical
+   L2 values added to the field instead.
+4. **Retire the legacy `ProspectStage` values now, brief reps after.** All 25 hold zero records;
+   20 retire immediately, 5 wait on the integration owner moving them to Source/Segment. Reps then
+   record outcomes in Call Disposition / Disqualification Reason instead of overloading stage.
+
+**Still open from this round:** reps read `Fresh` as *"assigned to me and I haven't called it
+yet"*. Reshuffling via bulk reassign means no static stage or field answers that, and there is no
+owner-assignment-date field on the Lead. Needs a **reset on reassignment** (clear disposition when
+Owner changes) or an owner-stamped field — not a new stage value. Not yet designed.
+
 ## Phase 5R stage restructure — resolved by Kaustubh, 2026-07-28
 
 Full context: `docs/STAGE_RESTRUCTURE_PLAN.md` section 9.
@@ -12,9 +38,10 @@ Full context: `docs/STAGE_RESTRUCTURE_PLAN.md` section 9.
 3. **`Not ICP Fit` suppressed from working views and the TAL.** APPROVED.
 4. **Contact Stage stays REP-WRITABLE**, and `Engaged` -> `Prospect` is a **manual rep
    decision**, not a call-outcome trigger — no single outcome reliably means "real deal now".
-   This supersedes the earlier read-only-rollup design. Driven by the transition reality:
-   for ~1 month half the team works account-level and half continues the legacy process, so
-   the contact record is the only control point both halves share.
+   This supersedes the earlier read-only-rollup design. This restructure is **org-wide**: every
+   rep cuts over together on migration night. (The half-account-level/half-contact-level split
+   is a separate, earlier initiative — "New SMB Outreach Model" — not this one; don't conflate
+   the two.)
 5. **Nothing is to be changed in production ahead of the migration.** Schemas and scripts are
    prepared, parse-verified and rehearsable; the whole thing runs as one unattended command
    on the night. Built: `scripts/leadsquared/migration/` + `MANUAL_STEPS.md`.
@@ -28,11 +55,14 @@ Full context: `docs/STAGE_RESTRUCTURE_PLAN.md` section 9.
    operational sheets live.** Deferred with decision 1, but it is the next thing to design.
 7. **`Meeting` activity type has zero custom fields** — no virtual/physical flag, no outcome.
    Client-requested pre-contract meetings are real but structurally unrecorded.
-8. **Does renaming a dropdown value carry existing records' stored values?** Not a business
-   call — needs a test on a throwaway custom field. Sizes the Company step only (~1.5 hr with
-   renames, ~6 hr without); the script writes whatever the rename did not, so it blocks
-   nothing. Evidence it is at least *supported*: the live Opportunity Won stage carries
-   `"Value":"Payment Recieved","OldValue":"Closed - Won"`.
+8. ~~**Does renaming a dropdown value carry existing records' stored values?**~~ **ANSWERED
+   2026-07-30 — no, for Company.** LSQ's own rename dialog warns *"Stages of the existing
+   Companies will not be updated."* Kaustubh surfaced this before proceeding; the rename was
+   **not** used. This invalidated the ~7-hour saving the plan had been built around, so all
+   71,483 companies were written individually instead (which ran clean). Worth remembering that
+   the earlier evidence for carry-over — the Opportunity Won stage showing
+   `"Value":"Payment Recieved","OldValue":"Closed - Won"` — was **misleading**: rename support
+   differs per object, and the Opportunity case does not generalise to Company.
 ## Resolved 2026-07-28 — native automation
 
 **Kaustubh: the sync must be native LSQ automation, not a script.** Researched and confirmed

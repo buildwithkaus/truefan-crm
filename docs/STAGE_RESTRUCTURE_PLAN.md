@@ -72,14 +72,19 @@ Mapped onto LeadSquared's fixed, non-editable Opportunity `Status`:
 > A rep never types a stage into more than one object.
 
 Locked 2026-07-28. Contact Stage stays **rep-writable** — this is not a read-only rollup —
-because the team is mid-transition: for roughly the next month **half the reps work at
-account level and half continue the legacy contact-by-contact process**. The contact record
-is the one surface both halves share, so it has to be the control point.
+because `Engaged -> Prospect` is a judgement call: no single call outcome reliably means "this
+is a real deal now" (see the manual trigger below), so a human has to make that call somewhere,
+and Contact is the object closest to the rep's actual work.
 
-Everything else is derived from it, automatically, for both halves of the team. That is the
-part that makes the transition safe: legacy-process reps keep working exactly as they do
-today, and correct company- and opportunity-level data accumulates underneath them anyway.
-When they switch over, their accounts are already populated.
+This restructure is **org-wide**: every rep cuts over together on migration night, not a
+phased rollout. (The half-account-level/half-contact-level split belongs to the separate *New
+SMB Outreach Model* work — don't conflate the two.)
+
+Everything else is derived from Contact Stage automatically, so a rep only ever writes to one
+place. The granular detail reps used to cram into `ProspectStage` — call outcome,
+disqualification reason — moves to its own dedicated fields (`Call Disposition`,
+`Disqualification Reason`/`Category`, Company's `Future Prospect Reason`) instead of
+overloading the stage.
 
 ### The three triggers
 
@@ -132,12 +137,14 @@ own pass later. Both `Payment Received` and `Customer` are Won and both drive Co
 Company to `Customer`; the split between them exists so that later refinement has somewhere
 to land.
 
-### Transition-period note
+### Old-value retention note
 
-Old `ProspectStage` values stay live in the dropdown alongside the 5 new ones for the whole
-transition month — `MANUAL_STEPS.md` step 1 is explicit that nothing is deleted. Legacy-process
-reps are not blocked, and no rep loses a value mid-week. The old values get hidden only once
-everyone has moved across.
+Old `ProspectStage` values stay live in the dropdown alongside the 5 new ones purely as a
+rollback safety margin — `MANUAL_STEPS.md` step 1 is explicit that nothing is deleted before
+the migration runs. Every lead moves to a new value on migration night (section 7.2); there is
+no group of reps still writing the old values afterward. Old values are hidden once Phase 5R's
+verification pass (steps 11-13) confirms clean, and fully retired once historical reporting
+needs are confirmed covered.
 
 ---
 

@@ -73,13 +73,22 @@ if (-not $CompaniesOnly) {
     $current = @{}
     $page = 1
     while ($true) {
-        $r = Invoke-LsqLeadSearch -Filter @{ LookupName="CreatedOn"; LookupValue="2000-01-01"; SqlOperator=">" } `
+        # Expand-LsqRows: a nested page reads .Count = 1, which would end this loop after one
+        # page and leave $current nearly empty - making the delta look tiny and the rollback
+        # silently restore almost nothing while reporting success. See common.ps1.
+        $r = @(Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{ LookupName="CreatedOn"; LookupValue="2000-01-01"; SqlOperator=">" } `
             -ColumnsCsv "ProspectID,ProspectStage" -SortColumn "CreatedOn" -SortDirection "1" `
-            -PageIndex $page -PageSize 1000
+            -PageIndex $page -PageSize 1000))
         if (-not $r -or @($r).Count -eq 0) { break }
         foreach ($l in $r) { $current[$l.ProspectID] = $l.ProspectStage }
         if (@($r).Count -lt 1000) { break }
         $page++; Start-Sleep -Milliseconds 250
+    }
+
+    # A short read here understates the delta and makes a broken rollback look like a clean
+    # one ("0 leads to restore"). Reconcile against the backup before trusting the comparison.
+    if ($current.Count -lt ($backup.Count * 0.9)) {
+        throw "Current-state read returned only $($current.Count) leads against a backup of $($backup.Count). REFUSING to compute a rollback delta from an incomplete read - it would silently restore only a fraction of the changed records. Re-run."
     }
 
     $pending = @($backup | Where-Object {
@@ -140,14 +149,52 @@ if (-not $LeadsOnly) {
     $page = 1
     while ($true) {
         $r = Invoke-LsqCompanySearch -CompanyTypeName "Company" -PageIndex $page -PageSize 1000
-        if (-not $r.Companies -or @($r.Companies).Count -eq 0) { break }
-        foreach ($c in $r.Companies) {
+        $companies = @(Expand-LsqRows $r.Companies)
+        if ($companies.Count -eq 0) { break }
+        foreach ($c in $companies) {
             $props = @{}
             foreach ($p in $c.companyPropertyList) { $props[$p.Attribute] = $p.Value }
             if ($props.CompanyId) { $current[$props.CompanyId] = $props.Stage }
         }
-        if (@($r.Companies).Count -lt 1000) { break }
+        if ($companies.Count -lt 1000) { break }
         $page++; Start-Sleep -Milliseconds 300
+    }
+    if ($current.Count -lt ($backup.Count * 0.9)) {
+        throw "Read current stages for only $($current.Count) companies against a backup of $($backup.Count). Refusing to compute a restore delta from an incomplete read."
+    }
+
+    # THE UI-RENAME TRAP. The migration is expected to be preceded by a UI rename of the
+    # Company Stage value 'Prospect' -> 'Future Prospect' (MANUAL_STEPS 2a), which carries
+    # ~44,700 companies to their target with zero writes. After that rename, 'Prospect' no
+    # longer EXISTS as a dropdown option - but this backup still stores it as the old value for
+    # ~67,000 companies. Blindly restoring would try to write a non-existent option to every one
+    # of them: tens of thousands of calls, and LeadSquared does not reliably reject an unknown
+    # dropdown string (proven on Opportunity mx_Custom_2, 2026-07-29), so it could quietly write
+    # a value no rep can see or select.
+    #
+    # Reversing the rename in the UI is both the correct fix AND instant - it restores every one
+    # of those companies for free. So detect the situation and stop with instructions rather
+    # than grinding out a slow, wrong restore.
+    $liveStages = @{}
+    foreach ($v in $current.Values) { if ($v) { $liveStages["$v"] = $true } }
+    $orphanStages = @{}
+    foreach ($b in $backup) {
+        $s = "$($b.Stage)"
+        if ($s -and -not $liveStages.ContainsKey($s)) {
+            if (-not $orphanStages.ContainsKey($s)) { $orphanStages[$s] = 0 }
+            $orphanStages[$s]++
+        }
+    }
+    if ($orphanStages.Count -gt 0) {
+        Write-LsqLog "" $logPath
+        Write-LsqLog "STOP - the backup holds Company Stage values that no longer exist in live data:" $logPath
+        foreach ($kv in ($orphanStages.GetEnumerator() | Sort-Object Value -Descending)) {
+            Write-LsqLog ("   [{0}] : {1} companies in the backup" -f $kv.Key, $kv.Value) $logPath
+        }
+        Write-LsqLog "This is what a UI rename looks like from the API side (MANUAL_STEPS 2a)." $logPath
+        Write-LsqLog "REVERSE THE RENAME IN THE UI FIRST - that restores those companies instantly" $logPath
+        Write-LsqLog "and for free - then re-run this script to fix whatever is still out of place." $logPath
+        throw "Company restore aborted: $($orphanStages.Count) stage value(s) in the backup no longer exist. Reverse the UI rename first (see the log for the exact values), then re-run."
     }
 
     $pending = @($backup | Where-Object {
@@ -162,7 +209,9 @@ if (-not $LeadsOnly) {
         $ok = 0; $fail = 0; $i = 0
         foreach ($row in $pending) {
             $i++
-            $body = "[{`"Attribute`":`"Stage`",`"Value`":`"$($row.Stage)`"}]"
+            # Company.Update requires the array wrapped in "CompanyProperties" - a bare array
+            # fails with MXInvalidDataTypeException on every call. See 05-migrate-companies.ps1.
+            $body = "{`"CompanyProperties`":[{`"Attribute`":`"Stage`",`"Value`":`"$($row.Stage)`"}]}"
             try {
                 $r = Invoke-LsqPost -Uri "$base/CompanyManagement.svc/Company.Update?accessKey=$ak&secretKey=$sk&companyId=$($row.CompanyId)" -JsonBody $body
                 if ($r.Status -eq "Success") { $ok++ } else { $fail++ }

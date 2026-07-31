@@ -42,10 +42,12 @@ $samplePool = @{}
 $total = 0
 $page = 1
 while ($true) {
-    $resp = Invoke-LsqLeadSearch `
+    # Expand-LsqRows: a nested page reads .Count = 1, ending this loop after one page - which
+    # would report a near-empty account as the verified post-migration state. See common.ps1.
+    $resp = @(Expand-LsqRows (Invoke-LsqLeadSearch `
         -Filter @{ LookupName = "CreatedOn"; LookupValue = "2000-01-01"; SqlOperator = ">" } `
         -ColumnsCsv "ProspectID,ProspectStage" -SortColumn "CreatedOn" -SortDirection "1" `
-        -PageIndex $page -PageSize 1000
+        -PageIndex $page -PageSize 1000))
     if (-not $resp -or $resp.Count -eq 0) { break }
     foreach ($l in $resp) {
         $total++
@@ -95,10 +97,14 @@ foreach ($stage in $Script:ContactStages) {
     $ids = $samplePool[$stage] | Get-Random -Count ([Math]::Min($SamplePerStage, $samplePool[$stage].Count))
     $bad = 0
     foreach ($id in $ids) {
-        $one = Invoke-LsqLeadSearch -Filter @{ LookupName = "ProspectId"; LookupValue = $id; SqlOperator = "=" } `
-            -ColumnsCsv "ProspectID,ProspectStage,mx_Disqualification_Reason,mx_Disqualification_Category,mx_Call_Disposition" `
-            -PageIndex 1 -PageSize 1
-        if (-not $one -or $one[0].ProspectStage -ne $stage) { $bad++; continue }
+        # Leads.Get CANNOT be filtered by lead id. Verified live 2026-07-30:
+        #   LookupName "ProspectId" -> 0 rows (this check previously failed EVERY sampled lead)
+        #   LookupName "ProspectID" -> 1 row, but the field values come back empty
+        #   Leads.GetById?id=...    -> the full, correct record
+        # Reading via the two Leads.Get forms would have reported a perfectly good migration as
+        # 100% broken, which is worse than no check at all.
+        $one = @(Expand-LsqRows (Invoke-RestMethod -Uri ((Get-LsqUrl "LeadManagement.svc/Leads.GetById") + "&id=$id") -Method Get))
+        if ($one.Count -eq 0 -or "$($one[0].ProspectStage)" -ne $stage) { $bad++; continue }
         # Disqualified must carry both a reason and a category - that is the whole point.
         if ($stage -eq "Disqualified") {
             if ([string]::IsNullOrWhiteSpace($one[0].mx_Disqualification_Reason) -or
@@ -122,11 +128,28 @@ foreach ($s in @("Prospect", "Customer")) {
 }
 $check = $dealContacts | Get-Random -Count ([Math]::Min(50, $dealContacts.Count))
 $missingOpp = 0
+$badOppStage = 0
+$oppStagesSeen = @{}
 foreach ($id in $check) {
     $url = "$base/OpportunityManagement.svc/GetOpportunitiesOfLead?accessKey=$ak&secretKey=$sk&leadId=$id&opportunityType=12000"
     try {
         $r = Invoke-RestMethod -Uri $url -Method Post -ContentType "application/json"
         if ($r.RecordCount -eq 0) { $missingOpp++; Write-LsqLog "    Lead $id is at a deal stage but has NO Opportunity" $logPath }
+        else {
+            # Existence alone is not verification: 06b rewrites these stage values, and a
+            # migration that left an Opportunity on a legacy value ("Requirement Gathering" /
+            # "Payment Recieved") would otherwise pass this check silently. The records are
+            # already in hand here, so validating the stage costs no extra API calls.
+            foreach ($o in $r.List) {
+                $st = $o.mx_Custom_2
+                if ([string]::IsNullOrWhiteSpace($st)) { $st = "<BLANK>" }
+                if ($oppStagesSeen.ContainsKey($st)) { $oppStagesSeen[$st]++ } else { $oppStagesSeen[$st] = 1 }
+                if ($Script:OpportunityStageRank.Keys -notcontains $st) {
+                    $badOppStage++
+                    Write-LsqLog "    Lead $id Opportunity $($o.OpportunityId) is on NON-CANONICAL stage [$st]" $logPath
+                }
+            }
+        }
     } catch {
         Write-LsqLog "    Lead $id opportunity check failed -> $($_.Exception.Message)" $logPath
     }
@@ -135,6 +158,13 @@ foreach ($id in $check) {
 $flag = if ($missingOpp -eq 0) { "OK" } else { "FAIL" }
 if ($missingOpp -gt 0) { $problems++ }
 Write-LsqLog ("  Prospect/Customer contacts without an Opportunity: {0}/{1} {2}" -f $missingOpp, $check.Count, $flag) $logPath
+
+$flag = if ($badOppStage -eq 0) { "OK" } else { "FAIL" }
+if ($badOppStage -gt 0) { $problems++ }
+Write-LsqLog ("  Opportunities on a non-canonical stage: {0} {1}" -f $badOppStage, $flag) $logPath
+foreach ($kv in ($oppStagesSeen.GetEnumerator() | Sort-Object Value -Descending)) {
+    Write-LsqLog ("    [{0}] = {1}" -f $kv.Key, $kv.Value) $logPath
+}
 
 $collisionPath = Join-Path $dataDir "migration_worklist_collisions.json"
 if (Test-Path $collisionPath) {

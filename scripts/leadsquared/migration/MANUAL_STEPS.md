@@ -24,8 +24,9 @@ Add, **alongside the existing 28 — delete nothing yet**:
 - `Customer`
 - `Disqualified` — already exists, leave it
 
-Old values stay live through the transition month, because half the team continues the
-legacy process. They get hidden only after everyone has moved over.
+Old values stay live purely as a rollback safety margin — every lead moves to a new value on
+migration night, org-wide, all at once. Nothing is deleted until the migration is verified
+successful; retire the unused old values in a later pass, not during this one.
 
 > `Disqualified` already exists with 25,078 leads on it. Those leads keep the same stage
 > string and simply gain a reason + category. No write is needed for the stage itself.

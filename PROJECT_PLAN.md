@@ -144,11 +144,82 @@ they are reused by the locked design, not replaced. Step 3 of the original plan 
 `ProspectStage` over to a clean list) is **superseded by Phase 5R below**, which replaces the
 6-value lifecycle sketch with the locked 5-value Contact model.
 
-## Phase 5R — Stage restructure across all three objects — **designed, blocked on 3 sign-offs**
+## Phase 5R — Stage restructure across all three objects — **DATA MIGRATION DONE 2026-07-31; automations still outstanding**
 
 Design locked 2026-07-28 by Kaustubh. **Full plan: `docs/STAGE_RESTRUCTURE_PLAN.md`.
 Rep-facing SOP: `docs/SOP_PIPELINE.md`.** Supersedes the 4-layer sketch previously in
 `memory/06-stage-taxonomy-design.md`.
+
+### Migration executed 2026-07-30/31
+
+| Step | Result |
+|---|---|
+| `06b` legacy Opportunity stages | 4,404 moved off `Requirement Gathering`/`Payment Recieved`; 50/50 verified |
+| `03` backup (rollback set) | leads 86,968 + companies 71,878, stamp `20260730-074038` |
+| `01` Lead fields | 4 created (Category, Segment, Revisit After, Needs Contact Resourcing) |
+| `04` Lead stages | 61,496 written |
+| `04b` residual sweep | 805 fixed |
+| `04c` mapped-field gaps | 25,497 disqualification reason/category (see the bug note below) |
+| `05` Company stages | all 71,483, zero failures |
+| `06` Opportunities | 159 created, 794 already existed |
+| `09`/`10`/`10b` Previous Contact Stage | 87,038 leads, zero gaps |
+| `07` verify | all 5 contact-stage samples clean; 0 Opportunities on a non-canonical stage |
+
+**The bug worth remembering:** `04` skipped rows where `OldStage -eq NewContactStage`. The legacy
+value `Disqualified` maps to the new value `Disqualified` - the same string - so 25,520 leads were
+logged as "already at target stage (skipped)" and never received their reason/category. Every
+write log said success; only an independent read of live state exposed it. `04`'s filter now also
+triggers on any mapped field being present.
+
+### Post-migration reconciliation, 2026-07-31 - **data complete except one item**
+
+Reps were told to keep marking the OLD stage values (there is still no easy call-outcome UI), so
+drift regenerated daily. Reconcilers `11` through `17` were built to absorb it. Current state,
+all verified by reading live data:
+
+| Layer | State |
+|---|---|
+| Contact Stage | 100% canonical across 89,845 leads, zero legacy values stored |
+| Call Disposition / Disq. Reason / Category / Segment | canonical, and every stored value is now a selectable dropdown option |
+| Previous Contact Stage | 87,038 leads, zero gaps |
+| Opportunity Stage | 0 on a legacy value; 961/961 deal-stage primaries have an Opportunity |
+| **Company Stage** | **5,557 behind - run `13-reconcile-companies.ps1 -Execute`** |
+
+**Fresh redefined (Kaustubh, 2026-07-31).** The three un-connected outcomes originally mapped to
+`Fresh` on the logic that no human was reached. That broke the bucket reps hunt in - 17,019 leads
+they had already dialled were sitting in it. `17-move-unconnected-to-engaged.ps1` moved **17,011
+leads, 0 failures**; Fresh is now 4,521 genuinely un-dialled leads, with the non-connect reason
+preserved in Call Disposition. `00-schema.ps1` updated to match. Accepted trade-off: `Engaged` no
+longer means "reached a human" (~79% is dial attempts). Unsolved: reps read Fresh as "untouched
+*by me*", and reshuffling means no static field answers that - needs reset-on-reassignment.
+
+**Two dropdown-vs-stored-value mismatches, both found by Kaustubh trying to filter.** LSQ stores a
+value that is not an option rather than rejecting it, so the record reads fine over the API while
+being invisible to reps. Call Disposition (3 invented plan names, 7,570 leads normalised - two of
+those names were also dropped as *unsupported by the data*: the legacy `RNR` never recorded a dial
+count) and Disqualification Reason (9 options vs 12 stored values, **zero overlap, 61,919 leads
+unfilterable**; fixed by extending the dropdown, since the old list could not express the new
+values). `16-verify-dropdown-coverage.ps1` now checks all six Lead dropdowns at once - run it after
+any future migration.
+
+**Legacy stage retirement is now unblocked.** All 25 legacy `ProspectStage` options hold zero
+records (full enumeration, twice). 20 are safe to retire immediately; 5 are preserved only because
+integrations still write them (`Retargetedlead`, `RetargetedleadEMAIL`, `ReQualified By WhatsApp`,
+`FB Lead - Website`, `SaaS`) and go once the integration owner moves them to Source/Segment. Exact
+list: `docs/HANDOVER_2026-07-31.md` section 5.
+
+**Still outstanding (not data):**
+- The 3 native LSQ automations (`docs/LSQ_AUTOMATION_SPEC.md`) - not built. See the Phase 6 note
+  on API-vs-UI triggering before specifying them further.
+- Activity `01. Phone Call/ Follow Up` (event 203) already captures Status + Connected/Not
+  Connected Outcome. The automation should derive Contact Stage and Call Disposition from it;
+  that is what makes the stage field system-owned and stops drift at source.
+- Contact `Engaged` -> `Prospect` should auto-create the Opportunity. Currently manual.
+- 124 non-primary contacts sit at Prospect/Customer. Opportunities were **deliberately not**
+  created for them - that is the account fragmentation rule 6 exists to prevent. Needs a rep
+  decision per account.
+- Two junk companies created by the bulk endpoint on `&` names need deleting in the UI:
+  `a57c9ad0-1a27-4ede-bad7-0cc2eb63defd`, `d59558ea-85a1-40c5-8070-c15edc4a90a5`.
 
 Three stage models, exactly one writable per rep:
 - Contact: Fresh → Engaged → Prospect → Customer, + Disqualified (+ reason)
@@ -163,10 +234,12 @@ Three triggers: first activity of any kind auto-moves Contact `Fresh`→`Engaged
 after that the Opportunity Stage drives everything. `Payment Received` makes Contact and
 Company `Customer`.
 
-Contact Stage deliberately stays rep-writable: for ~1 month **half the team works at account
-level and half continues the legacy process**, so the contact record is the only surface both
-halves share. Old `ProspectStage` values stay live in the dropdown through the transition —
-nothing is deleted until everyone has moved across.
+Contact Stage deliberately stays rep-writable: `Engaged`→`Prospect` is a judgement call, not
+something a call outcome can trigger reliably, so a human has to make it. This restructure is
+**org-wide** — every rep cuts over together on migration night, not a phased split (that split
+belongs to the separate "New SMB Outreach Model" work — don't conflate the two). Old
+`ProspectStage` values stay live in the dropdown only as a rollback safety margin until the
+migration is verified successful, then get retired.
 
 **All business decisions resolved 2026-07-28** (`memory/08-open-decisions.md`).
 
@@ -185,6 +258,17 @@ in `scripts/leadsquared/migration/MANUAL_STEPS.md`.
 **Decided 2026-07-28 (Kaustubh): this must be native LSQ automation, not a sync script.**
 Researched and confirmed buildable. Build spec: `docs/LSQ_AUTOMATION_SPEC.md`.
 Capability audit: `docs/AUTOMATION_CAPABILITIES.md`.
+
+**Constraint discovered 2026-07-31 — automations appear not to fire on API writes.** Kaustubh
+built a live automation (Company `Fresh`→`Nurture` when Contact goes `Fresh`→`Engaged`). A bulk
+job then moved 17,011 leads `Fresh`→`Engaged` via `Lead/Bulk/UpdateV2` and the Company backlog
+moved **5,115 → 5,111 in 19 minutes** — ordinary rep clicking, not a queue draining. So the
+automation almost certainly triggers on **UI edits only**. That is fine for its day job, but it
+means the call-outcome and Opportunity-creation automations may equally not fire when driven by
+an integration, the phone app, or a bulk job — and a non-firing automation looks identical to one
+that has not fired *yet*. **Confirm with the LSQ SPOC**, and until then assume every automation
+needs a reconciler alongside it (`12`/`13` in `scripts/leadsquared/migration/`). This does not
+overturn the native-automation decision; it adds a safety net to it.
 
 Three findings made it possible, after an earlier false negative:
 - **`Add Opportunity` is a LEAD automation action** (Type/Enquiry/Owner/Status/Stage

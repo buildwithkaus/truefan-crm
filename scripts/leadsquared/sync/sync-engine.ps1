@@ -303,7 +303,9 @@ foreach ($lead in $candidates) {
 
     # --- write company stage -----------------------------------------------------------
     if ($actions.CompanyStage -and $companyId) {
-        $body = "[{`"Attribute`":`"Stage`",`"Value`":`"$($actions.CompanyStage)`"}]"
+        # Company.Update requires the array wrapped in "CompanyProperties" - a bare array
+        # fails with MXInvalidDataTypeException on every call. See 05-migrate-companies.ps1.
+        $body = "{`"CompanyProperties`":[{`"Attribute`":`"Stage`",`"Value`":`"$($actions.CompanyStage)`"}]}"
         try {
             $r = Invoke-LsqPost -Uri "$base/CompanyManagement.svc/Company.Update?accessKey=$ak&secretKey=$sk&companyId=$companyId" -JsonBody $body
             if ($r.Status -eq "Success") {

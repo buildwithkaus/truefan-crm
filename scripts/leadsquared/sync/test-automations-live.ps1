@@ -269,20 +269,19 @@ Assert-State "step5 company not regressed" "Opportunity" (Get-CompanyStage -Comp
 # --- STEP 6/7: opportunity drives contact + company  [AUT-3] ----------------------------
 function Set-OpportunityStage {
     param([string]$OppId, [string]$LeadId, [string]$Stage, [string]$Status)
+    # Confirmed shape via apidocs.leadsquared.com/update-an-opportunity/ (2026-07-29). The
+    # previous {Opportunity:{...}, LeadDetails:[...]} shape throws ArgumentNullException on
+    # every call - never caught because this script had never been run live (the automations
+    # it tests did not exist yet). Also confirmed: OpportunityManagement.svc/Update has a
+    # propagation delay of several seconds before an independent re-fetch reflects the
+    # write - Wait-Settle's 45-60s margin already covers this, no change needed there.
     $body = @{
-        Opportunity = @{
-            OpportunityId     = $OppId
-            OpportunityEventCode = 12000
-            Fields = @(
-                @{ SchemaName = "Status";      Value = $Status },
-                @{ SchemaName = "mx_Custom_2"; Value = $Stage }
-            )
-        }
-        LeadDetails = @(
-            @{ Attribute = "ProspectID"; Value = $LeadId },
-            @{ Attribute = "SearchBy";   Value = "ProspectId" }
+        ProspectOpportunityId = $OppId
+        Fields = @(
+            @{ SchemaName = "Status";      Value = $Status },
+            @{ SchemaName = "mx_Custom_2"; Value = $Stage }
         )
-    } | ConvertTo-Json -Depth 8
+    } | ConvertTo-Json -Depth 5
     Invoke-LsqPost -Uri "$base/OpportunityManagement.svc/Update?accessKey=$ak&secretKey=$sk" -JsonBody $body | Out-Null
 }
 

@@ -56,8 +56,24 @@ foreach ($field in $Script:NewLeadFields) {
         IsMandatory = $false
     }
     if ($field.Options) {
-        $payload["OptionsJson"] = ($field.Options | ForEach-Object { @{ Value = $_ } } | ConvertTo-Json -Compress)
+        # A real JSON ARRAY, not a stringified one. Piping through ConvertTo-Json here produced
+        # a STRING, which the outer ConvertTo-Json then escaped again - the API rejected every
+        # dropdown field with 400 'Error converting value "[{...}]" to type List<Options>'
+        # (2026-07-30). All option lists here have 2+ entries, so the PS 5.1 single-element
+        # array collapse does not apply.
+        # Each option needs an explicit 1-based Order. Without it CreateLeadField returns 500
+        # MXMandatoryAttributeMissingException "You have skipped number in Order: 1,2."
+        # (The key must be OptionsJson - passing "Options" instead yields "You have not passed
+        # any option value.")
+        $ord = 0
+        $payload["OptionsJson"] = @($field.Options | ForEach-Object { $ord++; @{ Value = $_; Order = $ord } })
     }
+    # RenderTypeTextValue is mandatory - without it CreateLeadField returns 500
+    # MXMandatoryAttributeMissingException "You have not passed RenderTypeTextValue."
+    # Values taken from the live schema of an existing field of each kind rather than guessed:
+    # mx_Call_Disposition (DataType "Select") reports RenderTypeTextValue "Dropdown".
+    if ($field.DataType -eq "Date")   { $payload["RenderTypeTextValue"] = "Date" }
+    if ($field.DataType -eq "Select") { $payload["RenderTypeTextValue"] = "Dropdown" }
     $json = $payload | ConvertTo-Json -Depth 6
 
     if (-not $Execute) {

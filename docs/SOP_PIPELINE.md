@@ -3,6 +3,13 @@
 For: TrueFan sales reps. Effective from the changeover date announced in your briefing.
 Questions: Kaustubh Chauhan (Founder's Office).
 
+> **Status note for whoever runs the briefing (delete before circulating).** The data migration is
+> done and the five stages are live. The **automations described in Part 1 are not built yet** —
+> `Fresh` -> `Engaged` on first activity, and auto-creation of the deal record at `Prospect`, are
+> still manual. Either build them first or tell reps to set the stage themselves in the interim.
+> Do not hand this out claiming automation that is not running. See
+> `docs/HANDOVER_2026-07-31.md` section 8.
+
 ---
 
 ## What changed, in one paragraph
@@ -29,8 +36,8 @@ Fresh  ->  Engaged  ->  Prospect  ->  Customer
 
 | Stage | Means |
 |---|---|
-| **Fresh** | You have never had a live conversation with this person. Includes every un-connected dial. |
-| **Engaged** | You reached a human. Conversation is happening. No firm requirement yet. |
+| **Fresh** | **Nobody has dialled this contact yet.** This is your hunting pool for new accounts to call. |
+| **Engaged** | You have started working this contact. Either you reached a human, or you dialled and did not get through — **Call Disposition tells you which.** |
 | **Prospect** | There is a real deal here. A deal record gets created automatically. |
 | **Customer** | Payment received. |
 | **Disqualified** | Out of play. **Reason is mandatory.** |
@@ -154,7 +161,7 @@ no prospecting. That only works if you tagged them correctly on the way out.
 
 ## Part 5 — Accounts with several contacts
 
-If you are working at account level, one company can have several people in it.
+One company can have several people in it.
 
 - Only **one contact per account owns the deal** — the primary contact. That is whoever you
   first moved to `Prospect`. The system sets it.
@@ -167,11 +174,10 @@ If you are working at account level, one company can have several people in it.
 Five people at one company is not five opportunities. It is one opportunity with five people
 in the buying committee — a stronger deal, not a bigger number.
 
-> **During the transition month:** half the team is working at account level and half is
-> continuing the current contact-by-contact process. If you are in the second group, keep
-> working exactly as you do today — just use the five new stages. The company and deal records
-> build themselves underneath you, so when you switch over, your accounts are already set up.
-> You do not need to go back and redo anything.
+> **This applies to everyone, starting the same day.** There is no legacy option to keep
+> working the old way — the five stages above are the only stage field from the changeover
+> date on. What changes is *where* the detail goes: call outcome and disqualification reason
+> now live in their own fields instead of being crammed into the stage.
 
 ---
 
@@ -191,8 +197,9 @@ happen, in any order. Stage only moves forward.
 
 **Disqualifying** — category first, then reason. "Not ICP Fit" is permanent; use it carefully.
 
-**Not reached is not rejected.** RNR, did not pick and switched off keep a lead `Fresh` and in
-your queue.
+**Not reached is not rejected.** RNR, did not pick and switched off move a lead to `Engaged` with
+that outcome in **Call Disposition** — still fully in your queue, just no longer clogging `Fresh`.
+`Fresh` is reserved for contacts nobody has dialled yet, so it stays useful as a hunting pool.
 
 **One account, one deal.**
 
