@@ -11,7 +11,7 @@
 2. **Call Disposition keeps its six existing option names; the data is matched to them.** The plan
    had renamed two — rejected by Kaustubh, and he was right: the legacy `RNR` value never recorded
    a dial count, and `Follow Up` does not establish a pitch was delivered. Asserting either invents
-   precision the source data does not support. `00-schema.ps1` updated so no future run
+   precision the source data does not support. `scripts/lib/schema.ps1` updated so no future run
    reintroduces the qualifiers.
 3. **Disqualification Reason: extend the dropdown, do not revert the data.** The 9 legacy options
    cannot express `Not Interested - No Reason Stated` (25,527) or `Invalid Contact Data` (4,797) at
@@ -44,7 +44,7 @@ Full context: `docs/STAGE_RESTRUCTURE_PLAN.md` section 9.
    the two.)
 5. **Nothing is to be changed in production ahead of the migration.** Schemas and scripts are
    prepared, parse-verified and rehearsable; the whole thing runs as one unattended command
-   on the night. Built: `scripts/leadsquared/migration/` + `MANUAL_STEPS.md`.
+   on the night. Built: `scripts/migration/` + `MANUAL_STEPS.md`.
 
 ## OPEN — not blocking the migration
 
@@ -94,7 +94,7 @@ whether it can mail-merge the disqualification reason from the lead.
 
 **There is no automation API** (confirmed 2026-07-28: 13 endpoints probed, all 404, control
 call 200). The three automations are a UI build, like the Opportunity Type was. Verification is
-scripted though - `scripts/leadsquared/sync/test-automations-live.ps1 -Execute` runs the whole
+scripted though - `scripts/sync/test-automations-live.ps1 -Execute` runs the whole
 test plan against a throwaway account. See `07-write-capability-matrix.md`.
 
 ## Resolved earlier

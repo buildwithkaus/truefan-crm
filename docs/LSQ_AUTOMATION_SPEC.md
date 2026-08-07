@@ -12,7 +12,7 @@ Build these in **Workflow > Automation**. Admin access required.
 > *"you've created multiple duplicate automation triggers."* Publishing is blocked at design
 > time, so this would have failed on the build day rather than in testing. The five are now
 > merged into **three**. The funnel logic is unchanged; only the packaging differs, and the 46
-> tests in `scripts/leadsquared/sync/test-sync-rules.ps1` still describe the same behaviour.
+> tests in `scripts/sync/test-sync-rules.ps1` still describe the same behaviour.
 
 ---
 
@@ -187,7 +187,7 @@ apidocs.leadsquared.com has no Automation or Workflow category at all.
 
 So these three automations are a **UI build**, like the Opportunity Type was. Budget ~1 hour.
 
-What *can* be automated is the verification: `scripts/leadsquared/sync/test-automations-live.ps1`
+What *can* be automated is the verification: `scripts/sync/test-automations-live.ps1`
 runs the whole test plan below end to end against a real throwaway lead and reports which
 automations fired correctly. Build by hand, verify by script.
 
@@ -214,7 +214,7 @@ immediately if either one silently did nothing.
 
 ## Test plan — before switching on for all 18 reps
 
-**This is scripted**: `scripts/leadsquared/sync/test-automations-live.ps1 -Execute` runs the
+**This is scripted**: `scripts/sync/test-automations-live.ps1 -Execute` runs the
 whole table below against a throwaway account and reports pass/fail per check.
 
 Worth using rather than clicking through it, because automations are **asynchronous** — "I
@@ -243,7 +243,7 @@ The steps, if you would rather do it by hand on **one real account with two cont
 | 11 | Check the Automation Termination Report | **Empty.** Anything here means a lead hit the 50-trigger cap — a loop |
 
 Steps 3, 5, 8 and 11 are the ones that matter — the regression guards. Steps 3, 5 and 8 are the
-same cases as the 46 offline tests in `scripts/leadsquared/sync/test-sync-rules.ps1`, so the
+same cases as the 46 offline tests in `scripts/sync/test-sync-rules.ps1`, so the
 expected behaviour is already pinned down precisely; run those tests to see the intended
 semantics before building.
 
@@ -278,7 +278,7 @@ and a single-object automation does not.
 [ ] 3. Build AUT-1, publish
 [ ] 4. Build AUT-2, publish        <- set every condition to LATEST DATA as you go
 [ ] 5. Build AUT-3, publish
-[ ] 6. pwsh ./scripts/leadsquared/sync/test-automations-live.ps1 -Execute
+[ ] 6. pwsh ./scripts/sync/test-automations-live.ps1 -Execute
 [ ] 7. Fix anything it reports, re-run until clean. Delete the TESTAUTO-* records in the UI
 [ ] 8. After 24h: Automation Report execution counts + Termination Report + Failure Report
 [ ] 9. Rep briefing

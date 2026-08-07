@@ -1,7 +1,12 @@
 # Project Plan — TrueFan CRM Pipeline & Funnel Fix
 
-Status as of 2026-07-27. Read `CLAUDE.md` first for orientation and the API gotchas that
-apply to every phase below.
+Status as of 2026-08-08. Read `CLAUDE.md` first for orientation and the hard rules, and
+`docs/LSQ_API_GOTCHAS.md` for the API failure modes that apply to every phase below.
+
+**Where the project actually is:** the data-model work (Phases 1-5R) is done and reconciled.
+The live work is now Phase 9 — running the ICP assignment programme and holding reps to
+recording what they do. Phases 6 (automation) and 7 (training) remain open and are what
+would make Phase 9's findings self-correcting rather than something a report has to catch.
 
 ## Phase 0 — Foundation (done before this repo existed)
 
@@ -244,12 +249,12 @@ migration is verified successful, then get retired.
 **All business decisions resolved 2026-07-28** (`memory/08-open-decisions.md`).
 
 **Scripts built and parse-verified, nothing run against production**:
-`scripts/leadsquared/migration/` — `00-schema.ps1` (declarative mapping, 29 entries,
+`scripts/migration/` — `00-schema.ps1` (declarative mapping, 29 entries,
 smoke-tested to cover all 28 live values with a passing negative control) through
 `07-verify.ps1`, orchestrated by `run-migration.ps1`. One command, unattended, checkpointed
 and idempotent. Nothing writes without `-Execute`; `-Execute` refuses to start without
 `-ConfirmManualSteps` and aborts if another LSQ script is running. UI-only prerequisites are
-in `scripts/leadsquared/migration/MANUAL_STEPS.md`.
+in `scripts/migration/MANUAL_STEPS.md`.
 
 **Next**: rehearsal run (dry, safe in business hours) → manual UI steps → night run.
 
@@ -267,7 +272,7 @@ automation almost certainly triggers on **UI edits only**. That is fine for its 
 means the call-outcome and Opportunity-creation automations may equally not fire when driven by
 an integration, the phone app, or a bulk job — and a non-firing automation looks identical to one
 that has not fired *yet*. **Confirm with the LSQ SPOC**, and until then assume every automation
-needs a reconciler alongside it (`12`/`13` in `scripts/leadsquared/migration/`). This does not
+needs a reconciler alongside it (`12`/`13` in `scripts/migration/`). This does not
 overturn the native-automation decision; it adds a safety net to it.
 
 Three findings made it possible, after an earlier false negative:
@@ -304,13 +309,13 @@ confirm on-screen, both with fallbacks.
 control call returned 200) and by apidocs having no Automation/Workflow category. The three
 automations are a **UI build**, roughly an hour. Recorded in `memory/07-write-capability-matrix.md`.
 
-**Verification is scripted**: `scripts/leadsquared/sync/test-automations-live.ps1 -Execute`
+**Verification is scripted**: `scripts/sync/test-automations-live.ps1 -Execute`
 runs the full 9-step test plan against a throwaway account and reports pass/fail per check.
 It exists because automations are asynchronous — by eye, "not fired yet" looks identical to
 "never will" — and because the three regression guards assert that *nothing* happened, which
 is exactly what manual testing skips.
 
-The scripts in `scripts/leadsquared/sync/` remain as the **safety net**, not the mechanism:
+The scripts in `scripts/sync/` remain as the **safety net**, not the mechanism:
 - `validate-consistency.ps1` — nightly drift detector, 7 violation classes. **More important
   under native automation, not less** — a paused workflow or an execution cap fails silently.
 - `test-sync-rules.ps1` — **46 passing offline tests**; the executable specification of
@@ -355,6 +360,37 @@ migration, before reps start working — the migration changes what they see on 
 The original "New SMB Outreach Model" plan — now landing on a Company object that's
 scored (Phase 4), structurally correct (Phase 3), and clean of departed-owner noise
 (Phase 2). This is the actual behavior change reps experience day to day.
+
+## Phase 9 — ICP assignment & rep accountability — **running since 2026-08-04**
+
+Contacts carrying `Source = "Kaustubh ICP"` are assigned in blocks to reps, who are expected to
+call every one, and to record disposition, stage, disqualification reason and a note for each
+connect. `scripts/reports/icp-rep-compliance.ps1` measures actual outreach from the telephony
+log and grades the CRM record against it.
+
+Trajectory across the first four days (2026-08-04 → 08-07):
+
+| | 08-04 | 08-05 | 08-06 | 08-07 |
+|---|---|---|---|---|
+| Assigned | 600 | 971 | 1,320 | 1,714 |
+| Reps | 3 | 5 | 10 owners | 10 owners |
+| Coverage (called) | 20% | 63% | 71% | 71% |
+| Stage-update discipline | — | 55% | 74% | 69% |
+
+Standing problems, all detailed in `memory/11-crm-hygiene-findings.md`:
+
+1. **Notes are structurally impossible** — no Notes API, and the `Notes` field holds imported ICP
+   business descriptions. 0 notes captured across every run. **Needs a decision on a destination
+   before it can ever be non-zero.**
+2. **"Did Not Pick" is used on contacts that demonstrably connected** — 230 of them at the last
+   count, 183 where *every* attempt connected. It is the largest value in the funnel.
+3. **Disqualification Reason is blank on ~half of all disqualified contacts.**
+4. **Hygiene only improves in batch cleanups and degrades whenever real calling happens** —
+   which is the argument for Phase 6/7 rather than more reporting.
+
+Next: agree a note destination, lock the Disqualification Reason option list (new values are
+appearing faster than existing ones are used correctly), and settle what "Did Not Pick" means
+with all reps.
 
 ---
 

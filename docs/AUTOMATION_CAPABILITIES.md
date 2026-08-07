@@ -104,13 +104,13 @@ what reps see labelled **"Deal Stage"**. Writing a stage name into `Status` fail
 
 All parse-clean, ASCII-only, and **nothing has been run against production**.
 
-### Migration — `scripts/leadsquared/migration/`
+### Migration — `scripts/migration/`
 
 One command, unattended, checkpointed, idempotent. See `MANUAL_STEPS.md` for prerequisites.
 
 | Script | Purpose |
 |---|---|
-| `00-schema.ps1` | Declarative stage values, 29-entry mapping, field definitions |
+| `scripts/lib/schema.ps1` | Declarative stage values, 29-entry mapping, field definitions |
 | `01-create-fields.ps1` | Creates the 4 new Lead custom fields |
 | `02-build-worklist.ps1` | Enumerates live values, **aborts on any unmapped value**, builds worklists |
 | `03-backup.ps1` | Full state snapshot — the rollback |
@@ -121,7 +121,7 @@ One command, unattended, checkpointed, idempotent. See `MANUAL_STEPS.md` for pre
 | `08-rollback.ps1` | Restores Lead + Company stages from a backup set |
 | `run-migration.ps1` | Runs 02-07 in sequence |
 
-### Sync engine — `scripts/leadsquared/sync/`
+### Sync engine — `scripts/sync/`
 
 | Script | Purpose |
 |---|---|

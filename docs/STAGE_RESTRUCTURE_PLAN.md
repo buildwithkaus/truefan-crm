@@ -542,8 +542,8 @@ It needs a sandbox test or a LeadSquared support answer.
 
 Fallback if native automation cannot do it: a scheduled PowerShell job every 15 minutes,
 reading records modified since its last watermark and applying the section 2 sync matrix.
-Same API mechanisms already proven in `scripts/leadsquared/`, and the migration scripts in
-`scripts/leadsquared/migration/` already implement every write this job needs — the scheduled
+Same API mechanisms already proven in `scripts/archive/`, and the migration scripts in
+`scripts/migration/` already implement every write this job needs — the scheduled
 version is those same operations on a watermark instead of a full worklist. Slower to
 propagate (15 min vs instant) but functionally identical.
 
@@ -588,12 +588,12 @@ deal — the worst case is that the company stage lags 15 minutes behind the con
 
 ## 10. Execution — one command
 
-Everything below `scripts/leadsquared/migration/` is built and parse-verified. Nothing has
+Everything below `scripts/migration/` is built and parse-verified. Nothing has
 been run against production.
 
 | File | Does | Writes? |
 |---|---|---|
-| `00-schema.ps1` | Declarative config: stage values, the 29-entry mapping, field defs | No |
+| `scripts/lib/schema.ps1` | Declarative config: stage values, the 29-entry mapping, field defs | No |
 | `01-create-fields.ps1` | Creates the 4 new Lead custom fields | Only with `-Execute` |
 | `02-build-worklist.ps1` | Enumerates live values, **aborts on any unmapped value**, builds worklists | No |
 | `03-backup.ps1` | Full current-state snapshot — this is the rollback | No |
@@ -606,10 +606,10 @@ been run against production.
 
 ```powershell
 # Rehearsal. Safe any time, in business hours, writes nothing:
-pwsh ./scripts/leadsquared/migration/run-migration.ps1
+pwsh ./scripts/migration/run-migration.ps1
 
 # The night run, unattended:
-pwsh ./scripts/leadsquared/migration/run-migration.ps1 -Execute -ConfirmManualSteps
+pwsh ./scripts/migration/run-migration.ps1 -Execute -ConfirmManualSteps
 ```
 
 Safety properties, all implemented rather than intended:

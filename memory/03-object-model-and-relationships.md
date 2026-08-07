@@ -34,7 +34,7 @@ mapping" step from the Outreach Model email plugs into the data model.
 it is a custom field, `mx_Custom_2`, a SearchableDropdown with `ParentField = "Status"`.**
 The native `Status` field is displayed to reps as **"Deal Stage"** and holds the fixed
 Open/Won/Lost values. Anything reading or writing opportunity stage must target
-`mx_Custom_2`, not `Status`. `scripts/leadsquared/resume-opportunity-backfill.ps1` already
+`mx_Custom_2`, not `Status`. `scripts/archive/resume-opportunity-backfill.ps1` already
 does this correctly.
 
 **The Phase 3 blocker recorded in `PROJECT_PLAN.md` was already resolved** — the UI edit was

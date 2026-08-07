@@ -37,7 +37,7 @@ those 897 don't just sit dead under a non-working account indefinitely.
    mismatch (whitespace, near-duplicate) risks silently creating a duplicate company
    instead of updating the intended one. Not worth the risk when exact `CompanyId` was
    already in hand from the backup.
-5. Script: `scripts/leadsquared/reassign-departed-owners.ps1`. Run started 2026-07-27,
+5. Script: `scripts/archive/reassign-departed-owners.ps1`. Run started 2026-07-27,
    logs to `data/reassignment_log.txt` (gitignored).
 
 ## Status
@@ -98,7 +98,7 @@ active-rep names in `04-active-rep-roster.md` — **Rishi Saraswat is the only e
 overlap.** Zero of his Companies were affected (0 entries under his name in
 `departed_owner_companies_BACKUP.json`) — this was Leads-only.
 
-**Fix applied and verified**: `scripts/leadsquared/rollback-rishi-leads.ps1` restored
+**Fix applied and verified**: `scripts/archive/rollback-rishi-leads.ps1` restored
 `OwnerId` to Rishi's real GUID (`f033a0b3-1dd5-11f1-bd10-0a70299d455d`) for all 2,360
 leads, sourced directly from `OrigOwnerId`/`OrigOwnerName` already captured in the Phase 2
 backup — not a guess. Result: 2,360/2,360 succeeded, 0 failures
@@ -131,12 +131,12 @@ correctly captured anywhere in this migration — he's missing, not damaged. A f
 would need his real `OwnerId` (not currently known) to complete his reassignment.
 
 **Remediation**:
-- Leads: `scripts/leadsquared/rollback-rishi-leads.ps1` restored all 2,360 of Rishi's
+- Leads: `scripts/archive/rollback-rishi-leads.ps1` restored all 2,360 of Rishi's
   leads to his real `OwnerId`. 2,360/2,360 succeeded, verified via sample re-fetch + a
   live `OwnerId`-filtered count.
 - Companies: built `data/departed_owner_companies_BACKUP_corrected.json` (the original
   10,972-row backup minus the 1,868 rows with `OrigOwnerId` == Rishi's GUID → 9,104 rows).
-  `scripts/leadsquared/resume-company-reassignment.ps1` resumes from this corrected file,
+  `scripts/archive/resume-company-reassignment.ps1` resumes from this corrected file,
   skipping any company already confirmed Admin-owned (from the ~3,854 processed before the
   pause) — Leads are **not** re-run by this script, since the original
   `reassign-departed-owners.ps1`'s Lead path would silently undo the rollback if re-run
