@@ -51,9 +51,39 @@ $logPath = Join-Path $dataDir "pipeline_webhooks_log.txt"
 $cfg = Import-LsqConfig
 $base = $cfg['LSQ_API_HOST']; $ak = $cfg['LSQ_ACCESS_KEY']; $sk = $cfg['LSQ_SECRET_KEY']
 
-# WebhookEvent codes, from the LSQ API docs. Only the ones this pipeline needs.
+# WebhookEvent codes.
+#
+# THE DOCUMENTED OPPORTUNITY CODES ARE WRONG ON THIS ACCOUNT. The API docs list 31 Create,
+# 32 Update, 33 Field Update, 34 Stage Update, 35 Delete. Enumerated live 2026-08-08 by
+# creating each code, reading back the EventCode LeadSquared actually assigned, and deleting
+# it - the real mapping is shifted:
+#
+#     28 -> task_delete                (not an opportunity event at all)
+#     29 -> Opportunity_Post_Create
+#     30 -> Opportunity_Post_Update
+#     31 -> Opportunity_Post_Delete    <- the docs call this "Create"
+#     32 -> needs an opportunity field ("Opportunity Field value cannot be empty")
+#     33, 34 -> HTTP 500
+#     35, 36 -> "Webhook Event not found"
+#
+# Following the documentation put a DELETE listener on the account while trying to create a
+# Create listener. Always read back what was actually created.
+#
+# There is no working opportunity STAGE-change event, so stage tracking rides on
+# Opportunity_Post_Update (fires on any edit) and the stage is diffed against stored state.
 $EVT_ACTIVITY_CREATE = 2
 $EVT_LEAD_STAGE_CHANGE = 5
+$EVT_LEAD_FIELD_CHANGE = 26
+$EVT_OPPORTUNITY_CREATE = 29
+$EVT_OPPORTUNITY_UPDATE = 30
+
+# The Opportunity Type id on this account. Also the activity EventCode for opportunities.
+$OPPORTUNITY_TYPE_ID = "12000"
+
+# Lead fields whose change history the pipeline needs. LSQ permits only ONE field-change
+# webhook per field - a second returns MXDuplicateEntryException - so renaming one means
+# delete-then-create, not create-then-delete.
+$Script:TrackedLeadFields = @("mx_Call_Disposition", "ProspectStage", "mx_Disqualification_Reason")
 
 # The activity types to subscribe to, keyed by LSQ activity event code. These are the same
 # codes the activity trail uses - confirmed live 2026-08-08.
@@ -173,6 +203,70 @@ function New-ActivityWebhook {
     return Invoke-WebhookApi -Path "Create" -JsonBody ($payload | ConvertTo-Json -Depth 6)
 }
 
+function New-FieldChangeWebhook {
+    <#
+      Lead Field Value Change (26). This is the ONLY source of history for lead fields:
+      mx_Call_Disposition and ProspectStage hold a current value only, and LeadSquared keeps
+      no record of what they were before. Anything not captured here is unrecoverable.
+
+      The payload carries two COMPLETE lead snapshots (Before / After), so one hook per field
+      still yields exact old-to-new for everything on the record.
+
+      Like ActivityEvent, ChangedLeadField must be passed at the TOP LEVEL as well as inside
+      WebhookProperties - properties alone is rejected.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FieldName,
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][string]$TargetUrl,
+        [string]$HeaderSecret
+    )
+    $payload = [ordered]@{
+        Description           = $Description
+        URL                   = $TargetUrl
+        Method                = "POST"
+        ContentType           = "application/json"
+        WebhookEvent          = "$EVT_LEAD_FIELD_CHANGE"
+        ChangedLeadField      = $FieldName      # top level - required despite the docs
+        IsSpecificLandingPage = $false
+        NotifyOnFailure       = $true
+        WebhookProperties     = ('{"ChangedLeadField":"' + $FieldName + '"}')
+    }
+    if ($HeaderSecret) { $payload["CustomHeaders"] = @(@{ Key = "x-truefan-signature"; Value = $HeaderSecret }) }
+    return Invoke-WebhookApi -Path "Create" -JsonBody ($payload | ConvertTo-Json -Depth 6)
+}
+
+function New-OpportunityWebhook {
+    <#
+      Opportunity Create (29) / Update (30). See the code table at the top of this file for
+      why these are not the documented numbers.
+
+      Update rather than a stage-specific event because no stage event works on this account:
+      33 and 34 return HTTP 500 and 35/36 report "Webhook Event not found". Update fires on
+      any opportunity edit; the stage is diffed against stored state. Volume is negligible -
+      there are only ~1,300 deal-stage contacts in the whole account.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$EventCode,
+        [Parameter(Mandatory)][string]$Description,
+        [Parameter(Mandatory)][string]$TargetUrl,
+        [string]$HeaderSecret
+    )
+    $payload = [ordered]@{
+        Description           = $Description
+        URL                   = $TargetUrl
+        Method                = "POST"
+        ContentType           = "application/json"
+        WebhookEvent          = "$EventCode"
+        OpportunityEvents     = @($OPPORTUNITY_TYPE_ID)
+        IsSpecificLandingPage = $false
+        NotifyOnFailure       = $true
+        WebhookProperties     = ('{"OpportunityEvents":["' + $OPPORTUNITY_TYPE_ID + '"],"IsAsyncEnable":false}')
+    }
+    if ($HeaderSecret) { $payload["CustomHeaders"] = @(@{ Key = "x-truefan-signature"; Value = $HeaderSecret }) }
+    return Invoke-WebhookApi -Path "Create" -JsonBody ($payload | ConvertTo-Json -Depth 6)
+}
+
 function New-StageChangeWebhook {
     <#
       UNRESOLVED as of 2026-08-08 - this fails and the correct body is not known.
@@ -224,7 +318,9 @@ switch ($Action) {
         # JSON", including a literal {}. A field-change webhook on ProspectStage does the
         # same job and creates cleanly, so that is the route used.
         foreach ($evt in @("LeadActivity_Post_Create", "LeadActivity_Post_Update",
-                           "Lead_Field_Change", "Lead_Post_Stage_Change", "Lead_Post_Update")) {
+                           "Lead_Field_Change", "Lead_Post_Stage_Change", "Lead_Post_Update",
+                           "Opportunity_Post_Create", "Opportunity_Post_Update",
+                           "Opportunity_Post_Delete")) {
             try {
                 $res = Get-WebhookList -EventFilter $evt
                 Write-WebhookRows -Rows $res.Rows -RecordCount $res.RecordCount -Label $evt -LogPath $logPath
@@ -261,8 +357,11 @@ switch ($Action) {
         if (-not $Url) { throw "-Url is required." }
         if (-not $Secret) { Write-LsqLog "WARNING: no -Secret given; the endpoint will be unauthenticated." $logPath }
 
-        Write-LsqLog "Will create $($activityTargets.Count) activity webhooks + 1 stage-change webhook -> $Url" $logPath
-        foreach ($t in $activityTargets) { Write-LsqLog "  activity $($t.Code) - $($t.Name)" $logPath }
+        Write-LsqLog "Will create $($activityTargets.Count) activity + $($Script:TrackedLeadFields.Count) field-change + 2 opportunity webhooks -> $Url" $logPath
+        foreach ($t in $activityTargets) { Write-LsqLog "  activity      $($t.Code) - $($t.Name)" $logPath }
+        foreach ($f in $Script:TrackedLeadFields) { Write-LsqLog "  field-change  $f" $logPath }
+        Write-LsqLog "  opportunity   $EVT_OPPORTUNITY_CREATE - created" $logPath
+        Write-LsqLog "  opportunity   $EVT_OPPORTUNITY_UPDATE - updated" $logPath
 
         if (-not $Execute) {
             Write-LsqLog "" $logPath
@@ -283,11 +382,38 @@ switch ($Action) {
             Start-Sleep -Milliseconds 400
         }
 
-        try {
-            $r = New-StageChangeWebhook -TargetUrl $Url -HeaderSecret $Secret
-            Write-LsqLog "  created Lead Stage Change -> $($r.Message.Id)" $logPath
-        } catch {
-            Write-LsqLog "  FAILED Lead Stage Change -> $($_.Exception.Message)" $logPath
+        # Field-change hooks: the only source of history for disposition and stage.
+        foreach ($f in $Script:TrackedLeadFields) {
+            try {
+                $r = New-FieldChangeWebhook -FieldName $f `
+                        -Description "TrueFan pipeline - $f change" `
+                        -TargetUrl $Url -HeaderSecret $Secret
+                Write-LsqLog "  created field-change $f -> $($r.Message.Id)" $logPath
+            } catch {
+                $d = $_.ErrorDetails.Message; if (-not $d) { $d = $_.Exception.Message }
+                # Only one hook per field is permitted, so a duplicate here means it already
+                # exists - which is a pass, not a failure.
+                if ("$d" -match "already exists") { Write-LsqLog "  field-change $f already exists (ok)" $logPath }
+                else { Write-LsqLog "  FAILED field-change $f -> $d" $logPath }
+            }
+            Start-Sleep -Milliseconds 400
+        }
+
+        # Opportunity hooks. Codes 29/30, NOT the documented 31/32 - see the table at the top.
+        foreach ($o in @(
+            @{ Code = $EVT_OPPORTUNITY_CREATE; Name = "Opportunity created" },
+            @{ Code = $EVT_OPPORTUNITY_UPDATE; Name = "Opportunity updated" }
+        )) {
+            try {
+                $r = New-OpportunityWebhook -EventCode $o.Code `
+                        -Description "TrueFan pipeline - $($o.Name)" `
+                        -TargetUrl $Url -HeaderSecret $Secret
+                Write-LsqLog "  created $($o.Name) -> $($r.Message.Id)" $logPath
+            } catch {
+                $d = $_.ErrorDetails.Message; if (-not $d) { $d = $_.Exception.Message }
+                Write-LsqLog "  FAILED $($o.Name) -> $d" $logPath
+            }
+            Start-Sleep -Milliseconds 400
         }
 
         Write-LsqLog "" $logPath

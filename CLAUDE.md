@@ -135,6 +135,15 @@ new script. One line each:
 20. PostgREST bulk insert requires **every object to carry an identical key set**
     (`PGRST102`). Project rows through a fixed per-table schema before serialising rather
     than trusting each construction site to build the same hashtable.
+21. **The documented opportunity `WebhookEvent` codes are wrong.** Real mapping, enumerated
+    live: `29` Create, `30` Update, `31` **Delete** — the docs call 31 "Create", so following
+    them puts a delete-listener on the account. `33`/`34` return 500, `35`/`36` "not found",
+    so there is **no working opportunity stage-change event**. Always read back what was
+    actually created. Only **one field-change webhook per field** is allowed, so renaming one
+    means delete-then-create.
+22. PowerShell **aliases outrank functions**. A helper named `Del` is silently shadowed by
+    the built-in `del` → `Remove-Item`, so every call tries to delete a file path. Same
+    family as `$pid`: use approved verbs (`Remove-LsqWebhook`), never a short alias-like name.
 
 Plus: **no bulk Opportunity read endpoint and no bulk Activity read endpoint exist** — both cost
 one API call per lead, so always narrow to a candidate set first. **No Notes API exists** either.
