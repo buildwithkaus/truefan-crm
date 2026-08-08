@@ -34,6 +34,7 @@
 
 var TABS = {
   DASHBOARD: 'Dashboard',
+  PIPELINE: 'Pipeline State',
   REP_DAY: 'Rep Day',
   TREND: 'Daily Trend',
   FUNNEL: 'Funnel',
@@ -545,6 +546,7 @@ function refreshReports() {
   if (!lock.tryLock(5000)) return;
   try {
     writeDashboard_();
+    writePipelineState_();
     writeRepDay_();
     writeTrend_();
     writeFunnel_();
@@ -575,6 +577,8 @@ function writeDashboard_(days) {
 
   var sh = ensureSheet_(TABS.DASHBOARD);
   sh.clear();
+  clearBandings_(sh);
+  sh.setHiddenGridlines(true);
 
   // ---- KPI strip -------------------------------------------------------------------
   var dials = 0, connects = 0, contacts = 0, talk = 0, reps = 0;
@@ -585,21 +589,46 @@ function writeDashboard_(days) {
     talk += Number(totals[i].talk_min) || 0;
     reps = Math.max(reps, Number(totals[i].active_reps) || 0);
   }
-  sh.getRange(1, 1).setValue(days === 1 ? ('Calling dashboard - ' + istToday_() + ' (IST)')
-                                        : ('Calling dashboard - last ' + days + ' days'))
-    .setFontSize(14).setFontWeight('bold');
-  sh.getRange(2, 1).setValue('Refreshed ' + istStamp_(new Date()) + ' IST')
-    .setFontColor('#5f6368').setFontStyle('italic');
 
+  // NO merged cells anywhere on this tab. Sheets refuses to freeze a column boundary that
+  // cuts through a merge ("you can't freeze columns which contain only part of a merged
+  // cell"), and the frozen rep/stage columns matter more on a wide pivot than merging does.
+  // Long text in column A simply overflows across the empty cells beside it, which looks
+  // identical and cannot conflict.
+  sh.getRange(1, 1)
+    .setValue(days === 1 ? ('Calling dashboard  -  ' + istToday_() + '  (IST)')
+                         : ('Calling dashboard  -  last ' + days + ' days'))
+    .setFontFamily(THEME.font).setFontSize(THEME.titleSize + 3).setFontWeight('bold')
+    .setVerticalAlignment('middle');
+  sh.setRowHeight(1, 36);
+  sh.getRange(2, 1)
+    .setValue('Refreshed ' + istStamp_(new Date()) + ' IST   -   source: Supabase v_pivot_disposition')
+    .setFontFamily(THEME.font).setFontSize(9).setFontStyle('italic').setFontColor(THEME.subtitleFg);
+
+  // KPI cards, one column each so nothing spans the freeze boundary at column 2.
   var kpi = [
-    ['Dials', dials], ['Connected', connects],
-    ['Connect %', dials ? Math.round(1000 * connects / dials) / 10 : 0],
-    ['Contacts', contacts], ['Talk (min)', Math.round(talk)], ['Active reps', reps]
+    ['Dials', dials, '#,##0'],
+    ['Connected', connects, '#,##0'],
+    ['Connect %', dials ? Math.round(1000 * connects / dials) / 10 : 0, '0.0"%"'],
+    ['Contacts', contacts, '#,##0'],
+    ['Talk (min)', Math.round(talk), '#,##0'],
+    ['Active reps', reps, '#,##0']
   ];
   for (var k = 0; k < kpi.length; k++) {
-    sh.getRange(4, k + 1).setValue(kpi[k][0]).setFontSize(9).setFontColor('#5f6368');
-    sh.getRange(5, k + 1).setValue(kpi[k][1]).setFontSize(18).setFontWeight('bold');
+    var col = k + 1;
+    sh.getRange(4, col).setValue(kpi[k][0])
+      .setFontFamily(THEME.font).setFontSize(9).setFontColor(THEME.subtitleFg)
+      .setHorizontalAlignment('center');
+    sh.getRange(5, col).setValue(kpi[k][1])
+      .setFontFamily(THEME.font).setFontSize(18).setFontWeight('bold')
+      .setHorizontalAlignment('center').setNumberFormat(kpi[k][2]);
+    sh.getRange(4, col, 2, 1)
+      .setBackground(THEME.band)
+      .setBorder(true, true, true, true, false, false, THEME.border, SpreadsheetApp.BorderStyle.SOLID);
   }
+  sh.setRowHeight(4, 20);
+  sh.setRowHeight(5, 34);
+  sh.setRowHeight(6, 10);
 
   // ---- pivot ------------------------------------------------------------------------
   var dispSet = {}, cell = {}, repStages = {}, rowTot = {}, colTot = {};
@@ -633,18 +662,25 @@ function writeDashboard_(days) {
     return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
   });
 
-  var top = 7;
-  sh.getRange(top, 1).setValue('Calls by rep, stage at time of call, and disposition')
-    .setFontWeight('bold');
-  sh.getRange(top + 1, 1).setValue('* = value is not a selectable dropdown option in LSQ, so reps cannot filter on it')
-    .setFontColor('#5f6368').setFontStyle('italic').setFontSize(9);
+  var top = 8;
+  sh.getRange(top, 1)
+    .setValue('Calls by rep, stage at time of call, and disposition')
+    .setFontFamily(THEME.font).setFontSize(12).setFontWeight('bold');
+  sh.getRange(top + 1, 1)
+    .setValue('* = stored in LeadSquared but NOT a selectable dropdown option, so reps cannot filter on it.   ' +
+              '"<no history>" = the call predates disposition tracking; the value at the time is unrecoverable.')
+    .setFontFamily(THEME.font).setFontSize(9).setFontStyle('italic').setFontColor(THEME.subtitleFg);
 
   var header = ['Rep', 'Stage at call'].concat(cols).concat(['Total']);
-  var grid = [header];
+  var grid = [];
   var lastRep = null;
+  var repStartRows = [];
   for (var q = 0; q < keys.length; q++) {
     var parts = keys[q].split('||');
-    var row = [parts[0] === lastRep ? '' : parts[0], parts[1]];
+    // Blank the repeated rep name so the eye groups the stage rows under one owner.
+    var isNewRep = (parts[0] !== lastRep);
+    if (isNewRep) repStartRows.push(q);
+    var row = [isNewRep ? parts[0] : '', parts[1]];
     lastRep = parts[0];
     for (var cc = 0; cc < cols.length; cc++) {
       row.push(cell[keys[q] + '||' + cols[cc]] || '');
@@ -658,16 +694,125 @@ function writeDashboard_(days) {
   totRow.push(grand);
   grid.push(totRow);
 
+  var hRow = top + 2;
   if (grid.length === 1) {
-    sh.getRange(top + 2, 1).setValue('(no calls in range - check the Meta tab)').setFontColor('#5f6368');
+    sh.getRange(hRow, 1).setValue('No calls in range - check the Meta tab before assuming a quiet day')
+      .setFontFamily(THEME.font).setFontColor(THEME.muted).setFontStyle('italic');
     return;
   }
-  var hRow = top + 2;
-  sh.getRange(hRow, 1, grid.length, header.length).setValues(grid);
-  sh.getRange(hRow, 1, 1, header.length).setFontWeight('bold').setBackground('#f1f3f4');
-  sh.getRange(hRow + grid.length - 1, 1, 1, header.length).setFontWeight('bold').setBackground('#f8f9fa');
+
+  var w = header.length;
+  sh.getRange(hRow, 1, 1, w).setValues([header])
+    .setFontFamily(THEME.font).setFontSize(THEME.size).setFontWeight('bold')
+    .setBackground(THEME.headerBg).setFontColor(THEME.headerFg)
+    .setVerticalAlignment('middle').setWrap(true).setHorizontalAlignment('center');
+  sh.getRange(hRow, 1, 1, 2).setHorizontalAlignment('left');
+  sh.setRowHeight(hRow, 36);
+
+  sh.getRange(hRow + 1, 1, grid.length, w).setValues(grid)
+    .setFontFamily(THEME.font).setFontSize(THEME.size).setWrap(false);
+  // Counts right-aligned; the two label columns stay left.
+  sh.getRange(hRow + 1, 3, grid.length, w - 2).setNumberFormat('#,##0').setHorizontalAlignment('right');
+  sh.getRange(hRow + 1, 1, grid.length, 2).setHorizontalAlignment('left');
+
+  var totalRowIdx = hRow + grid.length;
+  sh.getRange(totalRowIdx, 1, 1, w).setFontWeight('bold').setBackground(THEME.totalBg);
+  sh.getRange(hRow + 1, w, grid.length, 1).setFontWeight('bold');   // row Total column
+
+  // A rule line above each new rep block, so the groups are readable without banding
+  // fighting the merged-looking rep column.
+  for (var rs = 1; rs < repStartRows.length; rs++) {
+    sh.getRange(hRow + 1 + repStartRows[rs], 1, 1, w)
+      .setBorder(true, null, null, null, null, null, THEME.border, SpreadsheetApp.BorderStyle.SOLID);
+  }
+  sh.getRange(hRow, 1, grid.length + 1, w)
+    .setBorder(true, true, true, true, false, false, THEME.border, SpreadsheetApp.BorderStyle.SOLID);
+
   sh.setFrozenRows(hRow);
-  sh.autoResizeColumns(1, Math.min(header.length, 20));
+  sh.setFrozenColumns(2);
+  sh.setColumnWidth(1, 170);
+  sh.setColumnWidth(2, 120);
+  for (var cw = 3; cw <= w; cw++) sh.setColumnWidth(cw, 96);
+}
+
+/**
+ * Pipeline State - what each rep HOLDS, as opposed to what they did.
+ *
+ * Sourced from the daily book snapshot (scripts/pipeline/03-snapshot-book.ps1), not from
+ * call activity: a rep can look busy on call volume while never touching most of their
+ * assigned list, because they keep re-dialling the same responsive contacts. Coverage_7d
+ * joins the two and is the column that exposes that.
+ *
+ * Fails soft. If the snapshot job has never run the tab says so plainly rather than showing
+ * an empty grid that reads as "this rep holds nothing".
+ */
+function writePipelineState_() {
+  var rows, coverage;
+  try {
+    rows = sbSelect_('v_pipeline_state_wide', 'select=*&order=book_size.desc', 200);
+    coverage = sbSelect_('v_book_coverage', 'select=*', 200);
+  } catch (e) {
+    var shx = ensureSheet_(TABS.PIPELINE);
+    shx.clear();
+    shx.getRange(1, 1).setValue('Pipeline State')
+      .setFontFamily(THEME.font).setFontSize(THEME.titleSize).setFontWeight('bold');
+    shx.getRange(3, 1).setValue('Not available: ' + e)
+      .setFontFamily(THEME.font).setFontColor(THEME.muted);
+    return;
+  }
+
+  if (!rows.length) {
+    var sh0 = ensureSheet_(TABS.PIPELINE);
+    sh0.clear();
+    sh0.getRange(1, 1).setValue('Pipeline State')
+      .setFontFamily(THEME.font).setFontSize(THEME.titleSize).setFontWeight('bold');
+    sh0.getRange(3, 1).setValue(
+      'No snapshot yet. Run:  pwsh ./scripts/pipeline/03-snapshot-book.ps1')
+      .setFontFamily(THEME.font).setFontColor(THEME.muted).setFontStyle('italic');
+    return;
+  }
+
+  var covByRep = {};
+  for (var i = 0; i < coverage.length; i++) covByRep[coverage[i].rep] = coverage[i];
+  for (var j = 0; j < rows.length; j++) {
+    var c = covByRep[rows[j].rep];
+    rows[j].contacts_called_7d = c ? c.contacts_called_7d : 0;
+    rows[j].coverage_7d_pct = c ? c.coverage_7d_pct : 0;
+  }
+
+  var sh = writeTable_(TABS.PIPELINE, [
+    ['rep', 'Rep'],
+    ['book_size', 'Book size'],
+    ['workable', 'Workable'],
+    ['fresh', 'Fresh'],
+    ['engaged', 'Engaged'],
+    ['prospect', 'Prospect'],
+    ['customer', 'Customer'],
+    ['disqualified', 'Disqualified'],
+    ['other', 'Other'],
+    ['pct_untouched', 'Untouched %'],
+    ['pct_at_prospect', 'At Prospect %'],
+    ['contacts_called_7d', 'Called (7d)'],
+    ['coverage_7d_pct', 'Coverage 7d %'],
+    ['as_of', 'As of']
+  ], rows,
+    'What each rep HOLDS, from the daily book snapshot. "Workable" excludes Customers and ' +
+    'Disqualified. "Coverage 7d" is the share of the workable book actually dialled in the ' +
+    'last week - high call volume with low coverage means the same contacts are being redialled.');
+
+  // Highlight the two columns worth acting on: a book that is mostly untouched, and a book
+  // that is barely being covered. Thresholds are deliberately blunt - this is a prompt to
+  // look, not a verdict.
+  var hRow = 4;
+  for (var r = 0; r < rows.length; r++) {
+    if (Number(rows[r].pct_untouched) >= 70) {
+      sh.getRange(hRow + r, 10).setBackground(THEME.warn);
+    }
+    if (Number(rows[r].coverage_7d_pct) < 10) {
+      sh.getRange(hRow + r, 13).setBackground(THEME.bad);
+    }
+  }
+  return sh;
 }
 
 function writeRepDay_() {
@@ -745,12 +890,15 @@ function writeMeta_() {
 
   var sh = ensureSheet_(TABS.META);
   sh.clear();
-  sh.getRange(1, 1, 14, 2).setValues([
-    ['TrueFan calling pipeline - health', ''],
+  clearBandings_(sh);
+  sh.setHiddenGridlines(true);
+
+  var rows = [
+    ['Pipeline health', ''],
     ['', ''],
     ['Reports refreshed', istStamp_(new Date()) + ' IST'],
     ['Minutes since last call ingested', isNaN(mins) ? 'never' : mins],
-    ['STATUS', stale ? 'STALE - nothing ingested recently. Check the webhook is still enabled.' : 'Live'],
+    ['STATUS', stale ? 'STALE - nothing ingested recently. Check the webhooks are still enabled.' : 'Live'],
     ['', ''],
     ['Calls today (IST)', h.calls_today],
     ['Calls stored (all time)', h.calls_stored],
@@ -758,42 +906,174 @@ function writeMeta_() {
     ['Contacts cached', h.contacts_cached],
     ['Calls awaiting enrichment', h.calls_awaiting_enrichment],
     ['', ''],
-    ['Rows parked (Supabase was down)', pending],
-    ['Unrecognised payloads', unparsed]
-  ]);
-  sh.getRange(1, 1).setFontWeight('bold').setFontSize(13);
-  sh.getRange(5, 1, 1, 2).setFontWeight('bold').setBackground(stale ? '#fce8e6' : '#e6f4ea');
-  if (pending > 0) sh.getRange(13, 1, 1, 2).setBackground('#fef7e0');
-  if (unparsed > 0) sh.getRange(14, 1, 1, 2).setBackground('#fef7e0');
-  sh.setColumnWidth(1, 300); sh.setColumnWidth(2, 560);
+    ['Rows parked (Supabase unreachable)', pending],
+    ['Unrecognised payloads', unparsed],
+    ['', ''],
+    ['Disposition history', 'exact from 2026-08-08; "<no history>" before that is by design'],
+    ['Notes', 'NOT captured - this reports what happened, not why']
+  ];
+  sh.getRange(1, 1, rows.length, 2).setValues(rows)
+    .setFontFamily(THEME.font).setFontSize(THEME.size);
+
+  sh.getRange(1, 1, 1, 2).merge().setFontWeight('bold').setFontSize(THEME.titleSize);
+  sh.setRowHeight(1, 32);
+  sh.getRange(5, 1, 1, 2).setFontWeight('bold')
+    .setBackground(stale ? THEME.bad : THEME.good)
+    .setBorder(true, true, true, true, false, false, THEME.border, SpreadsheetApp.BorderStyle.SOLID);
+  sh.getRange(3, 1, rows.length - 2, 1).setFontColor(THEME.subtitleFg);
+  sh.getRange(7, 2, 5, 1).setNumberFormat('#,##0').setHorizontalAlignment('left');
+
+  // Amber only when there is genuinely something to look at - a permanently coloured row
+  // stops being a signal.
+  if (pending > 0) sh.getRange(13, 1, 1, 2).setBackground(THEME.warn).setFontWeight('bold');
+  if (unparsed > 0) sh.getRange(14, 1, 1, 2).setBackground(THEME.warn).setFontWeight('bold');
+
+  sh.setColumnWidth(1, 300); sh.setColumnWidth(2, 620);
 }
 
-/** Columns are declared explicitly - an inferred header changes shape whenever a nullable
- *  field happens to be null in row 1, quietly breaking every formula built on top. */
+// =======================================================================================
+// PRESENTATION
+//
+// Every tab is cleared and rewritten on each refresh, which also wipes formatting - so all
+// styling has to be re-applied in code. Anything done by hand in the UI survives until the
+// next 10-minute trigger and then vanishes, which is why this layer exists.
+//
+// Formatting only ever changes DISPLAY, never values. Percentages in particular use the
+// format '0.0"%"' rather than '0.0%': the views already return 23.9 meaning 23.9 percent,
+// and Sheets' native percent format would multiply by 100 and show 2390%.
+// =======================================================================================
+
+var THEME = {
+  font: 'Arial',
+  size: 10,
+  headerBg: '#1f3864',
+  headerFg: '#ffffff',
+  titleSize: 15,
+  subtitleFg: '#5f6368',
+  band: '#f4f6fa',
+  border: '#d6dbe4',
+  totalBg: '#eef1f6',
+  good: '#e6f4ea',
+  warn: '#fef7e0',
+  bad: '#fce8e6',
+  muted: '#8a8f98'
+};
+
+/**
+ * Infer a column's display type from its key and values, so callers do not each have to
+ * declare formats. Key naming in the views is already consistent (_pct, _date, counts), and
+ * inference keeps the column definitions short enough to read.
+ */
+function colType_(key, rows) {
+  var k = String(key).toLowerCase();
+  if (k.indexOf('_pct') >= 0 || k.indexOf('rate') >= 0) return 'pct';
+  if (k.indexOf('date') >= 0) return 'date';
+  if (k.indexOf('_ist') >= 0 || k.indexOf('_utc') >= 0) return 'datetime';
+  if (k.indexOf('min') >= 0 || k.indexOf('talk') >= 0) return 'dec';
+  for (var i = 0; i < rows.length && i < 40; i++) {
+    var v = rows[i][key];
+    if (v === null || v === undefined || v === '') continue;
+    if (typeof v === 'boolean') return 'bool';
+    if (typeof v === 'number') return 'int';
+    return 'text';
+  }
+  return 'text';
+}
+
+var NUMFMT = { pct: '0.0"%"', int: '#,##0', dec: '#,##0.0', date: 'yyyy-mm-dd', datetime: 'yyyy-mm-dd hh:mm', bool: '', text: '' };
+var ALIGN  = { pct: 'right', int: 'right', dec: 'right', date: 'center', datetime: 'center', bool: 'center', text: 'left' };
+
+/** Bandings accumulate if re-applied, so any existing ones must be removed first. */
+function clearBandings_(sh) {
+  var b = sh.getBandings();
+  for (var i = 0; i < b.length; i++) b[i].remove();
+}
+
+/**
+ * Render a table with a title, header and body, formatted consistently.
+ *
+ * Columns are declared explicitly rather than inferred from the first row: an inferred
+ * header silently changes shape whenever a nullable field happens to be null in row 1,
+ * breaking every formula and pivot built on top of it.
+ */
 function writeTable_(name, colDefs, rows, subtitle) {
   var sh = ensureSheet_(name);
   sh.clear();
-  var header = colDefs.map(function (c) { return c[1]; });
-  var out = [header];
-  for (var i = 0; i < rows.length; i++) {
-    out.push(colDefs.map(function (c) {
-      var v = rows[i][c[0]];
-      return (v === null || v === undefined) ? '' : v;
-    }));
-  }
-  if (!rows.length) out.push(['(no rows as at ' + istStamp_(new Date()) + ' IST)']);
-  var w = header.length;
-  sh.getRange(1, 1, out.length, w).setValues(out.map(function (r) {
-    var c = r.slice(); while (c.length < w) c.push(''); return c;
-  }));
-  sh.getRange(1, 1, 1, w).setFontWeight('bold').setBackground('#f1f3f4');
-  sh.setFrozenRows(1);
+  clearBandings_(sh);
+  sh.setHiddenGridlines(true);
+
+  var w = colDefs.length;
+  var titleRows = subtitle ? 2 : 1;
+
+  sh.getRange(1, 1, 1, w).merge().setValue(name)
+    .setFontFamily(THEME.font).setFontSize(THEME.titleSize).setFontWeight('bold')
+    .setVerticalAlignment('middle');
+  sh.setRowHeight(1, 30);
   if (subtitle) {
-    sh.insertRowBefore(1);
-    sh.getRange(1, 1).setValue(subtitle).setFontStyle('italic').setFontColor('#5f6368');
-    sh.setFrozenRows(2);
+    sh.getRange(2, 1, 1, w).merge()
+      .setValue(subtitle + '   |   refreshed ' + istStamp_(new Date()) + ' IST')
+      .setFontFamily(THEME.font).setFontSize(9).setFontStyle('italic')
+      .setFontColor(THEME.subtitleFg).setWrap(false);
   }
+
+  var hRow = titleRows + 1;
+  sh.getRange(hRow, 1, 1, w).setValues([colDefs.map(function (c) { return c[1]; })])
+    .setFontFamily(THEME.font).setFontSize(THEME.size).setFontWeight('bold')
+    .setBackground(THEME.headerBg).setFontColor(THEME.headerFg)
+    .setVerticalAlignment('middle').setWrap(true);
+  sh.setRowHeight(hRow, 34);
+
+  if (!rows.length) {
+    sh.getRange(hRow + 1, 1).setValue('No rows as at ' + istStamp_(new Date()) + ' IST')
+      .setFontFamily(THEME.font).setFontColor(THEME.muted).setFontStyle('italic');
+    sh.setFrozenRows(hRow);
+    autoWidth_(sh, colDefs, rows);
+    return sh;
+  }
+
+  var body = rows.map(function (r) {
+    return colDefs.map(function (c) {
+      var v = r[c[0]];
+      return (v === null || v === undefined) ? '' : v;
+    });
+  });
+  var bRow = hRow + 1;
+  sh.getRange(bRow, 1, body.length, w).setValues(body)
+    .setFontFamily(THEME.font).setFontSize(THEME.size).setWrap(false);
+
+  // Per-column number format and alignment.
+  for (var c = 0; c < w; c++) {
+    var t = colType_(colDefs[c][0], rows);
+    var rng = sh.getRange(bRow, c + 1, body.length, 1);
+    if (NUMFMT[t]) rng.setNumberFormat(NUMFMT[t]);
+    rng.setHorizontalAlignment(ALIGN[t]);
+    sh.getRange(hRow, c + 1).setHorizontalAlignment(ALIGN[t] === 'left' ? 'left' : 'center');
+  }
+
+  sh.getRange(bRow, 1, body.length, w)
+    .applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, false, false);
+  sh.getRange(hRow, 1, body.length + 1, w)
+    .setBorder(true, true, true, true, true, true, THEME.border, SpreadsheetApp.BorderStyle.SOLID);
+
+  sh.setFrozenRows(hRow);
+  autoWidth_(sh, colDefs, rows);
   return sh;
+}
+
+/**
+ * Size columns from the header text and the widest sampled value. autoResizeColumns alone
+ * produces very wide columns for long free text (company names, the "what to fix" detail),
+ * which pushes the useful numbers off screen - so widths are clamped.
+ */
+function autoWidth_(sh, colDefs, rows) {
+  for (var c = 0; c < colDefs.length; c++) {
+    var longest = String(colDefs[c][1]).length;
+    for (var i = 0; i < rows.length && i < 200; i++) {
+      var v = rows[i][colDefs[c][0]];
+      if (v !== null && v !== undefined) longest = Math.max(longest, String(v).length);
+    }
+    sh.setColumnWidth(c + 1, Math.max(64, Math.min(240, 8 * longest + 24)));
+  }
 }
 
 

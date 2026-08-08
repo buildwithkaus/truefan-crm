@@ -36,7 +36,15 @@ param(
     [string]$FromDate = "2026-08-01",
     [int]$MaxApiCalls = 4000,
     [int]$BatchSize = 200,
-    [int]$SleepMs = 200
+    [int]$SleepMs = 200,
+
+    # Re-pull ONLY contacts at a deal stage, ignoring the checkpoint.
+    #
+    # Opportunity capture (EventCode 12000/33) was added after the first 4,000 contacts had
+    # already been loaded, so those rows have calls and stage history but no deals. Rather
+    # than re-pull all 4,000, this scopes to Prospect and Customer contacts - the only ones
+    # that can own an opportunity - which is roughly 1,000 calls instead of 4,000.
+    [switch]$DealStagesOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -79,19 +87,31 @@ if ($neg.Count -ne 0) { throw "NEGATIVE CONTROL FAILED - the watermark filter is
 $cols = "ProspectID,FirstName,LastName,Phone,Company,OwnerId,OwnerIdName,ProspectStage,mx_Call_Disposition,mx_Disqualification_Reason,mx_Segment,Source,ProspectActivityDate_Max,ProspectActivityName_Max"
 
 $all = New-Object System.Collections.Generic.List[object]
-$page = 1
-while ($true) {
-    $rows = @(Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{
-        LookupName = "ProspectActivityDate_Max"
-        LookupValue = $fromUtc.ToString("yyyy-MM-dd HH:mm:ss")
-        SqlOperator = ">"
-    } -ColumnsCsv $cols -PageIndex $page -PageSize 1000 -SortColumn "CreatedOn"))
-    if ($rows.Count -eq 0) { break }
-    foreach ($r in $rows) { [void]$all.Add($r) }
-    Write-LsqLog "  page $page -> $($rows.Count) (total $($all.Count))" $logPath
-    if ($rows.Count -lt 1000) { break }
-    $page++
-    if ($page -gt 200) { Write-LsqLog "  WARNING: stopped at 200 pages" $logPath; break }
+
+# Filters to page through. Normally one watermark scan; in deal-stage mode, one scan per
+# deal stage, because only a primary contact at Prospect or Customer can own an opportunity.
+$filters = @()
+if ($DealStagesOnly) {
+    Write-LsqLog "DEAL-STAGE MODE: scoping to Prospect and Customer, ignoring the checkpoint." $logPath
+    $filters += @{ LookupName = "ProspectStage"; LookupValue = "Prospect"; SqlOperator = "=" }
+    $filters += @{ LookupName = "ProspectStage"; LookupValue = "Customer"; SqlOperator = "=" }
+} else {
+    $filters += @{ LookupName = "ProspectActivityDate_Max"
+                   LookupValue = $fromUtc.ToString("yyyy-MM-dd HH:mm:ss"); SqlOperator = ">" }
+}
+
+foreach ($filter in $filters) {
+    $page = 1
+    while ($true) {
+        $rows = @(Expand-LsqRows (Invoke-LsqLeadSearch -Filter $filter `
+            -ColumnsCsv $cols -PageIndex $page -PageSize 1000 -SortColumn "CreatedOn"))
+        if ($rows.Count -eq 0) { break }
+        foreach ($r in $rows) { [void]$all.Add($r) }
+        Write-LsqLog "  [$($filter.LookupValue)] page $page -> $($rows.Count) (total $($all.Count))" $logPath
+        if ($rows.Count -lt 1000) { break }
+        $page++
+        if ($page -gt 200) { Write-LsqLog "  WARNING: stopped at 200 pages" $logPath; break }
+    }
 }
 $candidates = $all.ToArray()
 Write-LsqLog "Contacts touched since $FromDate : $($candidates.Count)" $logPath
@@ -101,11 +121,19 @@ if ($candidates.Count -eq 0) { throw "Zero candidates - refusing to report a cle
 # lead-touch volume and contributes nothing to rep metrics, so pulling those trails would
 # burn a large share of the daily API budget for data discarded on arrival.
 $before = $candidates.Count
-$scoped = @($candidates | Where-Object { "$($_.ProspectActivityName_Max)" -ne $Script:AI_ACTIVITY_NAME })
-Write-LsqLog "Excluded $($before - $scoped.Count) AI-dialler-only contacts" $logPath
+if ($DealStagesOnly) {
+    # No AI exclusion here. The point of this pass is to capture the deal on EVERY
+    # deal-stage contact, and a contact whose most recent touch happens to be the AI dialler
+    # still owns its opportunity. Excluding it would leave a hole in the deal board.
+    $scoped = $candidates
+    Write-LsqLog "Deal-stage mode: AI-dialler exclusion skipped, all $before contacts in scope" $logPath
+} else {
+    $scoped = @($candidates | Where-Object { "$($_.ProspectActivityName_Max)" -ne $Script:AI_ACTIVITY_NAME })
+    Write-LsqLog "Excluded $($before - $scoped.Count) AI-dialler-only contacts" $logPath
+}
 
 $done = @{}
-if (Test-Path $checkpointPath) {
+if ((Test-Path $checkpointPath) -and -not $DealStagesOnly) {
     foreach ($line in (Get-Content $checkpointPath)) { $t = $line.Trim(); if ($t) { $done[$t] = $true } }
     Write-LsqLog "Checkpoint holds $($done.Count) already-loaded contacts" $logPath
 }
@@ -140,6 +168,8 @@ $SbSchema = @{
     "dim_contact"       = @("prospect_id","company_name","full_name","phone","owner_id",
                             "owner_name","contact_stage","call_disposition",
                             "disqualification_reason","segment","source","last_refreshed_at")
+    "fact_opportunity"  = @("activity_id","prospect_id","opportunity_name","stage","status",
+                            "owner_id","created_at_utc","modified_at_utc","ingest_source")
 }
 
 function ConvertTo-SbJson {
@@ -211,18 +241,23 @@ $calls = New-Object System.Collections.Generic.List[object]
 $outcomes = New-Object System.Collections.Generic.List[object]
 $stages = New-Object System.Collections.Generic.List[object]
 $contacts = New-Object System.Collections.Generic.List[object]
+$opportunities = New-Object System.Collections.Generic.List[object]
 
 $apiCalls = 0; $pulled = 0; $failed = 0
-$wroteCalls = 0; $wroteStages = 0; $wroteOutcomes = 0; $wroteContacts = 0
+$wroteCalls = 0; $wroteStages = 0; $wroteOutcomes = 0; $wroteContacts = 0; $wroteOpps = 0
 $batchLeads = New-Object System.Collections.Generic.List[string]
 
 function Flush-Batch {
     $script:wroteCalls    += Invoke-SbUpsert -Table "fact_call"          -Rows $calls.ToArray()
     $script:wroteOutcomes += Invoke-SbUpsert -Table "fact_call_outcome"  -Rows $outcomes.ToArray()
     $script:wroteStages   += Invoke-SbUpsert -Table "fact_stage_change"  -Rows $stages.ToArray()
+    $script:wroteOpps     += Invoke-SbUpsert -Table "fact_opportunity"   -Rows $opportunities.ToArray()
     $script:wroteContacts += Invoke-SbUpsert -Table "dim_contact"        -Rows $contacts.ToArray()
+    # Checkpoint only AFTER every table has been written. Recording a lead as done before
+    # its rows land would make a mid-flush failure permanently skip it on the next run.
     foreach ($id in $batchLeads.ToArray()) { Add-Content -Path $checkpointPath -Value $id }
-    $calls.Clear(); $outcomes.Clear(); $stages.Clear(); $contacts.Clear(); $batchLeads.Clear()
+    $calls.Clear(); $outcomes.Clear(); $stages.Clear(); $contacts.Clear()
+    $opportunities.Clear(); $batchLeads.Clear()
 }
 
 foreach ($lead in $todo) {
@@ -296,6 +331,26 @@ foreach ($lead in $todo) {
                 ingest_source = "backfill"
             })
         }
+        elseif ($code -eq $Script:EVENT_OPPORTUNITY -or $code -eq $Script:EVENT_OPP_CAPTURED) {
+            # Shape confirmed live 2026-08-08: mx_Custom_1 is the opportunity NAME,
+            # mx_Custom_2 is the DEAL STAGE, and Status is the native Open/Won/Lost.
+            # Unbounded by date, like stage changes - a deal opened in July is still the
+            # live deal on an August contact, and excluding it would make the deal board
+            # look emptier than the account actually is.
+            $af = $a.ActivityFields
+            [void]$opportunities.Add([ordered]@{
+                activity_id      = (Get-LsqActivityId $a)
+                prospect_id      = $leadId
+                opportunity_name = "$($af.mx_Custom_1)"
+                stage            = "$($af.mx_Custom_2)"
+                status           = "$($af.Status)"
+                owner_id         = "$($af.Owner)"
+                created_at_utc   = (ConvertTo-IsoUtc $when)
+                modified_at_utc  = (ConvertTo-IsoUtc (ConvertFrom-LsqUtc "$($a.ModifiedOn)"))
+                ingest_source    = "backfill"
+            })
+            continue
+        }
         elseif ($code -eq $Script:EVENT_CALL_FORM) {
             $af = $a.ActivityFields
             [void]$outcomes.Add([ordered]@{
@@ -329,6 +384,7 @@ Write-LsqLog "  trails pulled  : $pulled  (failed $failed)" $logPath
 Write-LsqLog "  API calls used : $apiCalls" $logPath
 Write-LsqLog "  calls written  : $wroteCalls" $logPath
 Write-LsqLog "  stage changes  : $wroteStages" $logPath
+Write-LsqLog "  opportunities  : $wroteOpps" $logPath
 Write-LsqLog "  outcome forms  : $wroteOutcomes" $logPath
 Write-LsqLog "  contacts       : $wroteContacts" $logPath
 Write-LsqLog "  remaining      : $remaining" $logPath
