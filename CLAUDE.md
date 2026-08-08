@@ -112,9 +112,34 @@ new script. One line each:
 12. PowerShell traps: `@()` on a `List[object]` throws; a function that logs *and* returns hands
     back both; `ConvertTo-Json` collapses single-element arrays; `object[,]` flattens on return.
 13. GNU sed eats `\0` and `\l` — use PowerShell `String.Replace` for Windows path rewrites.
+14. The Activity record: PK is the top-level `Id`; `ActivityEvent_Note` has **duplicate keys**
+    (take the last non-empty); 3002 has no `ActivityFields` at all; 203 and 22 reuse
+    `mx_Custom_2/3` for different things; never branch on `Type`. Use `scripts/lib/activity.ps1`.
+15. `Webhook.svc`: `ActivityEvent` must ALSO go at the top level of the create body (docs say
+    otherwise, and the doc's form 500s); `WebhookProperties` must be an escaped JSON *string*;
+    `Delete` is a **GET**. A webhook endpoint must return **200 always** - ten non-200s disable
+    it - and must answer a payload-less verification ping.
+16. The webhook payload and the activity trail use **`Data` for different things** (fields
+    object vs array of `{Key,Value}`). A normaliser for one silently reads nothing from the
+    other. The webhook payload is complete, and it **does** fire on telephony-created calls.
+17. Timestamp formats vary **by field**: `ProspectActivityDate_Max` carries milliseconds
+    (`2026-08-08 07:38:00.000`), activity `CreatedOn` does not. A parser missing `.fff`
+    returns null and the caller skips every row — which looks like an empty day, not an error.
+18. A substituted placeholder is only safe in the **last** position of a `coalesce` chain.
+    `coalesce(x, '<unknown>')` upstream defeats `coalesce(that, fallback)` downstream, because
+    the placeholder is not null. Collapsed 980 calls onto one row.
+19. PowerShell: `$pid`, `$host`, `$error`, `$input`, `$args`, `$matches` are **read-only
+    automatic variables** — assigning one throws mid-run. And `@()` on an
+    `Invoke-RestMethod` result counts `$null` as 1 and a nested array as 1; prefer
+    `Invoke-WebRequest | ConvertFrom-Json`.
+20. PostgREST bulk insert requires **every object to carry an identical key set**
+    (`PGRST102`). Project rows through a fixed per-table schema before serialising rather
+    than trusting each construction site to build the same hashtable.
 
 Plus: **no bulk Opportunity read endpoint and no bulk Activity read endpoint exist** — both cost
 one API call per lead, so always narrow to a candidate set first. **No Notes API exists** either.
+`ProspectActivityName_Max` ("last activity") *is* filterable and is the cheapest way to narrow a
+candidate set — but it holds a single value, so never use it as a hard exclusion (gotcha 14).
 
 ## Reporting conventions
 

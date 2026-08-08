@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  /* Palette: reference instance, validated with scripts/validate_palette.js.
+     Dials/connects are two steps of ONE hue because they measure the same thing at
+     different depth (a part of a whole), not two independent categories - an ordinal
+     ramp, validated for both modes: light #86b6ef/#2a78d6, dark #1c5cab/#3987e5.
+     Status colors are fixed, never themed, and always ship with a text label so the
+     colour never carries the meaning on its own. */
+  :root {
+    color-scheme: light;
+    --surface-1:      #fcfcfb;
+    --page:           #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --gridline:       #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --bar-total:      #86b6ef;
+    --bar-connect:    #2a78d6;
+    --good:           #0ca30c;
+    --warning:        #fab219;
+    --critical:       #d03b3b;
+    --good-wash:      #e6f4ea;
+    --critical-wash:  #fce8e6;
+    --warning-wash:   #fef7e0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface-1:      #1a1a19;
+      --page:           #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --gridline:       #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --bar-total:      #1c5cab;
+      --bar-connect:    #3987e5;
+      --good-wash:      #12301a;
+      --critical-wash:  #3a1614;
+      --warning-wash:   #33280a;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px;
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--page); color: var(--text-primary);
+  }
+  h1 { font-size: 18px; margin: 0; font-weight: 650; }
+  .sub { color: var(--text-secondary); font-size: 12px; margin-top: 2px; }
+
+  header { display: flex; justify-content: space-between; align-items: flex-start;
+           gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+
+  /* Status banner. Always carries a text label - never colour alone. */
+  .banner { padding: 9px 13px; border-radius: 8px; font-size: 13px; font-weight: 600;
+            display: flex; align-items: center; gap: 8px; }
+  .banner.ok       { background: var(--good-wash);     color: var(--text-primary); }
+  .banner.warn     { background: var(--warning-wash);  color: var(--text-primary); }
+  .banner.critical { background: var(--critical-wash); color: var(--text-primary); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .dot.ok { background: var(--good); } .dot.warn { background: var(--warning); }
+  .dot.critical { background: var(--critical); }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+           gap: 10px; margin-bottom: 18px; }
+  .tile { background: var(--surface-1); border: 1px solid var(--border);
+          border-radius: 10px; padding: 13px 15px; }
+  .tile .label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+                 color: var(--text-muted); }
+  .tile .value { font-size: 27px; font-weight: 660; margin-top: 3px; line-height: 1.1; }
+  .tile .foot  { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
+
+  .panel { background: var(--surface-1); border: 1px solid var(--border);
+           border-radius: 10px; padding: 15px; margin-bottom: 16px; }
+  .panel h2 { font-size: 13px; margin: 0 0 11px; font-weight: 640;
+              text-transform: uppercase; letter-spacing: .04em; color: var(--text-secondary); }
+
+  .legend { display: flex; gap: 14px; font-size: 11px; color: var(--text-secondary);
+            margin-bottom: 10px; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+            margin-right: 5px; vertical-align: -1px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; font-weight: 600; font-size: 11px; text-transform: uppercase;
+       letter-spacing: .03em; color: var(--text-muted); padding: 0 8px 7px;
+       border-bottom: 1px solid var(--gridline); white-space: nowrap; }
+  td { padding: 7px 8px; border-bottom: 1px solid var(--gridline);
+       font-variant-numeric: tabular-nums; }
+  td.name { font-variant-numeric: normal; font-weight: 550; }
+  tr:last-child td { border-bottom: none; }
+  .num { text-align: right; }
+
+  /* Nested bar: total behind, connects in front, 2px surface gap so the two never
+     visually merge. 4px rounded data-end, anchored to the baseline at left. */
+  .barwrap { position: relative; height: 17px; min-width: 90px; background: transparent; }
+  .bar { position: absolute; left: 0; top: 2px; height: 13px; border-radius: 0 4px 4px 0; }
+  .bar.total   { background: var(--bar-total); }
+  .bar.connect { background: var(--bar-connect); border: 2px solid var(--surface-1);
+                 border-left: none; height: 13px; }
+
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px;
+          font-weight: 600; }
+  .pill.good { background: var(--good-wash); color: var(--text-primary); }
+  .pill.warn { background: var(--warning-wash); color: var(--text-primary); }
+  .pill.bad  { background: var(--critical-wash); color: var(--text-primary); }
+
+  .ticker { max-height: 320px; overflow-y: auto; }
+  .tick { display: flex; gap: 10px; align-items: baseline; padding: 6px 0;
+          border-bottom: 1px solid var(--gridline); font-size: 13px; }
+  .tick:last-child { border-bottom: none; }
+  .tick .t { color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums;
+             flex: none; width: 46px; }
+  .tick .who { font-weight: 550; flex: none; width: 130px;
+               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tick .what { color: var(--text-secondary); overflow: hidden;
+                text-overflow: ellipsis; white-space: nowrap; }
+  .tick.new { animation: flash 1.6s ease-out; }
+  @keyframes flash { from { background: var(--good-wash); } to { background: transparent; } }
+
+  .empty { color: var(--text-muted); font-size: 13px; padding: 14px 0; }
+  .scroll { overflow-x: auto; }
+  @media (prefers-reduced-motion: reduce) { .tick.new { animation: none; } }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Live calling activity</h1>
+    <div class="sub" id="subtitle">Loading...</div>
+  </div>
+  <div class="banner ok" id="banner"><span class="dot ok"></span><span id="bannerText">Connecting</span></div>
+</header>
+
+<div class="tiles" id="tiles"></div>
+
+<div class="panel">
+  <h2>Today by rep</h2>
+  <div class="legend">
+    <span><span class="swatch" style="background:var(--bar-total)"></span>Dials</span>
+    <span><span class="swatch" style="background:var(--bar-connect)"></span>Connected</span>
+  </div>
+  <div class="scroll"><table id="repTable"><tbody></tbody></table></div>
+</div>
+
+<div class="panel">
+  <h2>Live call feed</h2>
+  <div class="ticker" id="ticker"><div class="empty">Waiting for calls...</div></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<script>
+  /* JSON.stringify supplies the surrounding quotes and escaping, and <?!= ?> prints it
+     unescaped - <?= ?> would HTML-escape the quotes into &quot; and break the script.
+     Both values come from Script Properties set by an administrator, never from user
+     input, so there is nothing untrusted being interpolated here. */
+  var SUPABASE_URL = <?!= JSON.stringify(supabaseUrl) ?>;
+  var SUPABASE_ANON_KEY = <?!= JSON.stringify(supabaseAnonKey) ?>;
+</script>
+<script>
+(function () {
+  'use strict';
+
+  var sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    auth: { persistSession: false }
+  });
+
+  var IST_OFFSET_MS = 330 * 60 * 1000;
+  function istToday() {
+    return new Date(Date.now() + IST_OFFSET_MS).toISOString().slice(0, 10);
+  }
+  function istClock(iso) {
+    return new Date(new Date(iso).getTime() + IST_OFFSET_MS).toISOString().slice(11, 16);
+  }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+
+  // -----------------------------------------------------------------------------------
+  // Health banner. A dashboard that has quietly stopped receiving data looks exactly like
+  // a slow afternoon, so staleness is stated in words rather than implied by an empty page.
+  // -----------------------------------------------------------------------------------
+  function renderBanner(h) {
+    var banner = document.getElementById('banner');
+    var mins = h && h.minutes_since_last_ingest;
+    var cov = h ? h.latest_webhook_coverage_pct : null;
+
+    var cls = 'ok', msg;
+    if (mins === null || mins === undefined) {
+      cls = 'critical'; msg = 'No data has ever been ingested';
+    } else if (mins > 60) {
+      cls = 'critical'; msg = 'STALE - nothing ingested for ' + mins + ' min. Do not trust these numbers.';
+    } else if (mins > 15) {
+      cls = 'warn'; msg = 'Delayed - last ingest ' + mins + ' min ago';
+    } else if (cov !== null && cov !== undefined && cov < 60) {
+      // Not a data-freshness problem, but the thing most worth knowing: the webhook is not
+      // firing and the hourly reconciler is silently carrying the whole system.
+      cls = 'warn'; msg = 'Live (webhook coverage only ' + cov + '% - reconciler is filling the gap)';
+    } else {
+      cls = 'ok'; msg = 'Live - updated ' + (mins <= 1 ? 'just now' : mins + ' min ago');
+    }
+    banner.className = 'banner ' + cls;
+    banner.innerHTML = '<span class="dot ' + cls + '"></span><span>' + esc(msg) + '</span>';
+  }
+
+  function tile(label, value, foot) {
+    return '<div class="tile"><div class="label">' + esc(label) + '</div>' +
+           '<div class="value">' + esc(value) + '</div>' +
+           (foot ? '<div class="foot">' + esc(foot) + '</div>' : '') + '</div>';
+  }
+
+  function pill(pct) {
+    if (pct === null || pct === undefined) return '<span class="pill">-</span>';
+    var c = pct >= 85 ? 'good' : (pct >= 60 ? 'warn' : 'bad');
+    return '<span class="pill ' + c + '">' + pct + '%</span>';
+  }
+
+  function renderTiles(rows, h) {
+    var dials = 0, connects = 0, worked = 0, prospects = 0;
+    rows.forEach(function (r) {
+      dials += r.dials || 0;
+      connects += r.connects || 0;
+      worked += r.contacts_worked || 0;
+      prospects += r.moved_to_prospect || 0;
+    });
+    var rate = dials ? Math.round(1000 * connects / dials) / 10 : 0;
+
+    document.getElementById('tiles').innerHTML =
+      tile('Dials today', dials, rows.length + ' reps active') +
+      tile('Connected', connects, rate + '% connect rate') +
+      tile('Contacts worked', worked) +
+      tile('Moved to Prospect', prospects) +
+      tile('Queue depth', h ? h.queue_pending : '-', 'pending webhook jobs') +
+      tile('Webhook coverage',
+           (h && h.latest_webhook_coverage_pct != null) ? h.latest_webhook_coverage_pct + '%' : 'n/a',
+           'share delivered live');
+  }
+
+  function renderReps(rows) {
+    var tbody = document.querySelector('#repTable tbody');
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td class="empty">No calls logged yet today.</td></tr>';
+      return;
+    }
+    var max = Math.max.apply(null, rows.map(function (r) { return r.dials || 0; })) || 1;
+
+    var html = '<tr><th>Rep</th><th>Activity</th><th class="num">Dials</th>' +
+               '<th class="num">Conn</th><th class="num">Conn %</th>' +
+               '<th class="num">Talk</th><th class="num">Prospect</th>' +
+               '<th>Discipline</th><th class="num">Issues</th></tr>';
+
+    rows.forEach(function (r) {
+      var dials = r.dials || 0, conn = r.connects || 0;
+      var issues = (r.gap_still_fresh || 0) + (r.gap_connected_no_disposition || 0) +
+                   (r.gap_disqualified_no_reason || 0) + (r.gap_disposition_contradicts || 0);
+      html += '<tr>' +
+        '<td class="name">' + esc(r.rep_name) + '</td>' +
+        '<td><div class="barwrap">' +
+          '<div class="bar total" style="width:' + (100 * dials / max) + '%"></div>' +
+          '<div class="bar connect" style="width:' + (100 * conn / max) + '%"></div>' +
+        '</div></td>' +
+        '<td class="num">' + dials + '</td>' +
+        '<td class="num">' + conn + '</td>' +
+        '<td class="num">' + (r.connect_rate_pct == null ? '-' : r.connect_rate_pct + '%') + '</td>' +
+        '<td class="num">' + (r.talk_time_min == null ? '-' : r.talk_time_min + 'm') + '</td>' +
+        '<td class="num">' + (r.moved_to_prospect || 0) + '</td>' +
+        '<td>' + pill(r.stage_discipline_pct) + '</td>' +
+        '<td class="num">' + (issues || '') + '</td>' +
+      '</tr>';
+    });
+    tbody.innerHTML = html;
+  }
+
+  function renderTicker(rows) {
+    var el = document.getElementById('ticker');
+    if (!rows.length) {
+      el.innerHTML = '<div class="empty">No calls yet today.</div>';
+      return;
+    }
+    el.innerHTML = rows.map(function (c) {
+      var outcome = c.connected ? (c.duration_sec + 's') : 'no answer';
+      var where = [c.company_name, c.contact_name].filter(Boolean).join(' - ');
+      return '<div class="tick">' +
+        '<span class="t">' + esc(istClock(c.called_at_utc)) + '</span>' +
+        '<span class="who">' + esc(c.actor_name || 'unknown') + '</span>' +
+        '<span class="what">' + esc(where || c.prospect_id) + ' &middot; ' +
+          esc(outcome) + (c.stage_at_call ? ' &middot; was ' + esc(c.stage_at_call) : '') +
+        '</span></div>';
+    }).join('');
+  }
+
+  // -----------------------------------------------------------------------------------
+  // Data load. Realtime signals THAT something changed; the aggregates are always re-read
+  // from the views so the dashboard and the Sheets workbook can never drift apart by
+  // computing the same numbers two different ways.
+  // -----------------------------------------------------------------------------------
+  var loading = false;
+  async function refresh() {
+    if (loading) return;
+    loading = true;
+    try {
+      var today = istToday();
+      var results = await Promise.all([
+        sb.from('v_rep_day').select('*').eq('report_date', today).order('dials', { ascending: false }),
+        sb.from('v_call_enriched').select('*').eq('call_date_ist', today)
+          .order('called_at_utc', { ascending: false }).limit(40),
+        sb.from('v_pipeline_health').select('*').limit(1)
+      ]);
+
+      var reps = results[0].data || [];
+      var calls = results[1].data || [];
+      var health = (results[2].data || [])[0] || null;
+
+      renderBanner(health);
+      renderTiles(reps, health);
+      renderReps(reps);
+      renderTicker(calls);
+
+      document.getElementById('subtitle').textContent =
+        today + ' IST  |  auto-refreshing  |  ' + calls.length + ' calls shown';
+    } catch (err) {
+      var b = document.getElementById('banner');
+      b.className = 'banner critical';
+      b.innerHTML = '<span class="dot critical"></span><span>Cannot reach Supabase: ' +
+                    esc(String(err && err.message ? err.message : err)) + '</span>';
+    } finally {
+      loading = false;
+    }
+  }
+
+  // Debounced: a rep dialling through a list fires many inserts in a burst, and one
+  // re-query per insert would hammer the database for no visible benefit.
+  var pending = null;
+  function scheduleRefresh() {
+    clearTimeout(pending);
+    pending = setTimeout(refresh, 1200);
+  }
+
+  sb.channel('calling-live')
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'fact_call' }, scheduleRefresh)
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'fact_stage_change' }, scheduleRefresh)
+    .subscribe();
+
+  refresh();
+  // Realtime can drop silently behind a proxy. A slow poll guarantees the page still
+  // converges - and, more importantly, that the staleness banner keeps updating even when
+  // the websocket is the thing that died.
+  setInterval(refresh, 60000);
+})();
+</script>
+</body>
+</html>

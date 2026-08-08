@@ -284,6 +284,173 @@ you edited with — otherwise the same escaping bug hides the failure twice.
 
 ---
 
+## 14. The Activity record shape (and three beliefs about it that were wrong)
+
+Established live 2026-08-08 by fetching a real `EventCode 22` record and printing every field.
+None of this was written down, because every report in `scripts/reports/` only ever *aggregated*
+activities — so the record's own identity had never been needed, and several assumptions about it
+turned out to be wrong. `scripts/lib/activity.ps1` and
+`supabase/functions/_shared/normalize.ts` encode all of it; use those rather than re-deriving.
+
+The captured shape:
+
+```
+Id                  GUID   <-- the primary key
+EventCode           22 | 21 | 203 | 3002 | 12000 | 33 | 208
+EventName           "Outbound Phone Call Activity"
+CreatedOn           "2026-07-31 05:33:50"     <-- UTC, sortable format
+ModifiedOn          "2026-07-31 05:35:00"
+RelatedProspectId   GUID of the lead
+ActivityType        3 (call) | 26 (stage change) | 2 (custom form)
+Type                "Outbound" | "Inbound" | "Information"   <-- NOT reliable
+Data                array of {Key,Value}   <-- on 22 AND on 3002
+ActivityFields      object                 <-- ABSENT entirely on 3002
+```
+
+**The primary key is the top-level `Id`.** `ActivityFields.ProspectActivityAutoId` is a second,
+integer identifier on the same record. Anything that *stores* activities must key on one of these
+or it silently double-counts on every re-ingest — and a duplicate row inflates a call count
+without ever looking like an error.
+
+**`ActivityEvent_Note` contains DUPLICATE keys.** Verbatim from the live record:
+
+```
+Caller{=}Vikhyat Verma{next}UserId{=}{next}UserId{=}4057ed7a-21ce-11f1-bd10-0a70299d455d
+{next}Duration{=}64{next}Status{=}Answered{next}CallNotes{=}{next}ResourceURL{=}
+{next}StartTime{=}7/31/2026 5:33:49 AM{next}Tag{=}{next}DisplayNumber{=}{next}...
+```
+
+`UserId` appears twice and **the first one is empty**. `icp-rep-compliance.ps1`'s
+`Get-CallNoteValue` matches non-greedily and returns the first hit, so it reads `""` for `UserId`
+on every record while appearing to work perfectly. Scan every occurrence and take the last
+non-empty one. Keys seen: `Caller`, `UserId`, `Duration`, `Status`, `CallNotes`, `ResourceURL`,
+`StartTime`, `Tag`, `DisplayNumber`, `EventNote`, `SourceData`.
+
+**EventCode 3002 has no `ActivityFields` whatsoever** — only `Data[]`, carrying `PreviousStage`,
+`CurrentStage`, `CreatedBy` (a display **NAME**, not a GUID) and `Comment`. This settles a direct
+contradiction in the repo: `daily-calling-report.ps1` was right, `memory/10-rep-activity-
+measurement.md` ("its ActivityFields are empty, so old->new is not available") was wrong.
+
+**EventCode 22 also carries `Data[]`** — `CallType` (e.g. `Complete`), `Caller`, `Duration`,
+`ResourceUrl` — which is an independent cross-check on `mx_Custom_3` and a useful fallback when
+that field is empty.
+
+**Never branch on the `Type` field.** A Callkaro `EventCode 208` outbound AI call reports
+`Type="Inbound"`. Branch on `EventCode`, always.
+
+**EventCode 203 and EventCode 22 reuse `mx_Custom_2` and `mx_Custom_3` for completely different
+things** — 203: Connected Outcome / Next Step. 22: Start Time / Call Duration. Any generic
+`mx_Custom_N` flattener that does not branch on event code first will silently mix call durations
+into text outcomes.
+
+**Two timestamp formats appear on one record.** Activity-level `CreatedOn` is
+`"2026-07-31 05:33:50"`; `ActivityFields.CreatedOn` is `"7/31/2026 5:33:50 AM"`. Neither carries a
+zone and both are UTC. Parse with explicit formats and InvariantCulture — a bare `[datetime]` cast
+is culture-dependent and transposes day and month on an en-GB machine.
+
+### `ProspectActivityName_Max` is filterable, and is the cheapest candidate filter available
+
+Verified 2026-08-08: negative control returned 0 rows, and the value tally reconciled exactly
+(5,823 / 5,823) against the scanned total. Distribution over a two-day window:
+
+| Value | Leads |
+|---|---|
+| `Outbound Phone Call Activity` | 3,032 |
+| **`AI Phone Call / Follow Up`** | **2,405** |
+| `Dynamic Form Submission` | 122 |
+| `Opportunity` | 107 |
+| `Inbound Phone Call Activity` | 99 |
+| `Lead Capture` | 51 |
+| `01. Phone Call/ Follow Up` | 7 |
+
+Two consequences. First, **Callkaro is 41% of all lead-touch volume**, so excluding it roughly
+halves the cost of any watermark-driven job. Second — and this is the trap — the field holds a
+**single** value, so a rep call followed by an AI dialler touch on the same lead reads as AI.
+**Never use it as a hard exclusion without a fallback pass that ignores it**, or you rebuild the
+silent-skip failure this document already describes twice (gotchas 2 and 9). The pipeline handles
+this by putting the exclusion in SQL where the watermark is visible (a never-before-seen lead is
+always pulled) and by running an end-of-day pass with no name filter at all.
+
+Note also that `01. Phone Call/ Follow Up` (EventCode 203) is **not dead** — `memory/11` records
+it as unused since November 2025, but it is the last activity on 806 leads account-wide.
+
+## 15. `Webhook.svc` - three undocumented contract quirks
+
+Established live 2026-08-08 by probing body shapes until one worked. **Native Webhooks are a
+different subsystem from Automations**, and this repo did not know the feature existed - it
+is the mechanism the calling pipeline now runs on. Working code:
+`scripts/pipeline/01-manage-webhooks.ps1`.
+
+**`ActivityEvent` must be passed at the TOP LEVEL of the create body.** The documentation
+shows it only inside the `WebhookProperties` string. That form alone fails:
+
+```
+HTTP 500  MXInvalidDataTypeException: "You have not passed ActivityEvent."
+```
+
+Send both - `WebhookProperties` as documented *and* a top-level `ActivityEvent`.
+
+**`WebhookProperties` must be a STRING of escaped JSON, not a nested object.** Passing an
+object returns `400` with a JSON parse error. So the working body is:
+
+```json
+{ "WebhookEvent": "2",
+  "ActivityEvent": "22",
+  "WebhookProperties": "{\"ActivityEvent\":\"22\",\"ActivityData\":\"[]\",\"WebPageNames\":\"[]\"}" }
+```
+
+**`Delete` is a GET with the id in the query string.** `POST` - the pattern every other
+`Webhook.svc` verb uses - returns `405 Method Not Allowed`:
+
+```
+GET /v2/Webhook.svc/Delete?accessKey=..&secretKey=..&webhookId=<id>
+```
+
+**And the failure mode that made this expensive:** LSQ returns **500** for malformed input
+here, which `Invoke-LsqWithRetry` correctly classifies as transient and retries four times.
+The real message only appears in `$_.ErrorDetails.Message`. Three retries of a
+"server error" that was actually a body-shape bug - the same family as gotcha 3.
+
+### The webhook contract itself
+
+From LSQ's best-practices page, and all three are load bearing:
+
+- **Always return HTTP 200, even on error.** Report the problem in a `StatusReason` field.
+  **Ten consecutive non-200s disable the webhook** and re-enabling is manual - so returning
+  `401` to a bad secret lets anyone switch off ingestion by posting garbage eleven times.
+- **Verification is performed with NO payload.** A handler that requires a body never
+  verifies, so the webhook never activates at all.
+- **Activity webhooks are batched** - LSQ groups everything from one minute together, so the
+  body is always an array. Measured latency: about 2 minutes.
+
+Custom headers are supported (up to 10) - but **Apps Script cannot read request headers**, so
+an Apps Script receiver has to fall back to a query-string secret.
+
+## 16. The webhook payload and the activity trail use the same key for different things
+
+Both describe an activity. They are not the same shape, and one key actively lies:
+
+| `ProspectActivity.svc/Retrieve` | `Lead Activity Creation` webhook |
+|---|---|
+| `Id` | `ProspectActivityId` |
+| `EventCode` | `ActivityEvent` |
+| `EventName` | `ActivityEventName` |
+| `ActivityFields` (object of fields) | **`Data`** (object of fields) |
+| **`Data`** (ARRAY of `{Key,Value}`) | *(absent)* |
+| `ActivityFields.ActivityEvent_Note` | `Data.Note` |
+| `ActivityFields.CreatedBy` | top-level `CreatedBy` |
+
+**`Data` is an array of key/value pairs on the trail and the fields object on the webhook.**
+A normaliser written for one reads nothing from the other, and reads it *silently* - no
+error, just empty columns. Keep the two normalisers separate and named for their source;
+`appsscript/CallingPipeline.gs` has `normalizeWebhookActivity_`, and
+`supabase/functions/_shared/normalize.ts` has the trail version.
+
+The good news buried in this: **the webhook payload is complete.** Activity id, lead id,
+actor, timestamp, status, duration and the note blob all arrive, so recording a call needs
+zero API calls. And **it does fire on telephony-created activities** - proven with real
+handset calls by two reps - which gotcha 11 gave good reason to doubt.
+
 ## No bulk Opportunity read endpoint exists
 
 Eight candidate names probed 2026-07-28; all 404 except per-lead access

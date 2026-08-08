@@ -15,3 +15,13 @@ Thumbs.db
 
 # PowerShell transcripts
 *.transcript
+
+# Supabase local state. Migrations and edge functions ARE committed; the linked-project
+# temp state and any local env file are not.
+supabase/.branches
+supabase/.temp
+supabase/.env
+
+
+# Dashboard workbooks - contain real call records, contact names and phone numbers
+*.xlsx

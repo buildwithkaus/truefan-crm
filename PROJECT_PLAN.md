@@ -5,8 +5,9 @@ Status as of 2026-08-08. Read `CLAUDE.md` first for orientation and the hard rul
 
 **Where the project actually is:** the data-model work (Phases 1-5R) is done and reconciled.
 The live work is now Phase 9 — running the ICP assignment programme and holding reps to
-recording what they do. Phases 6 (automation) and 7 (training) remain open and are what
-would make Phase 9's findings self-correcting rather than something a report has to catch.
+recording what they do — plus Phase 10, the real-time calling pipeline, which is built and
+awaiting deploy. Phases 6 (automation) and 7 (training) remain open and are what would make
+Phase 9's findings self-correcting rather than something a report has to catch.
 
 ## Phase 0 — Foundation (done before this repo existed)
 
@@ -391,6 +392,73 @@ Standing problems, all detailed in `memory/11-crm-hygiene-findings.md`:
 Next: agree a note destination, lock the Disqualification Reason option list (new values are
 appearing faster than existing ones are used correctly), and settle what "Did Not Pick" means
 with all reps.
+
+## Phase 10 — Real-time calling pipeline — **LIVE since 2026-08-08 11:51 IST**
+
+Replaces the hand-run reports in `scripts/reports/` with a standing system.
+**LSQ webhooks → Apps Script → Supabase → Sheets / Excel.**
+Full runbook: **`docs/CALLING_PIPELINE.md`**. What was learned: **`memory/12`**.
+
+First full day: **1,169 dials, 298 connects, 25.5% connect rate, 14 reps.**
+
+```
+6 LSQ webhooks  activity 22/21/203  +  field-change on disposition / stage / disq reason
+      |  batched per minute, ~2 min latency
+      v
+Apps Script (appsscript/CallingPipeline.gs)   normalise -> upsert, always returns 200
+      |  enrichLeads 10m | flushPending 5m | refreshReports 10m
+      v
+Supabase Postgres    fact_call / fact_stage_change / fact_field_change / dim_contact + v_*
+      |
+      +-> Google Sheet (always-on monitor)    +-> Excel PivotTables (docs/EXCEL_DASHBOARD.md)
+```
+
+Decisions (Kaustubh, 2026-08-08): webhook-driven; Supabase as the store; Excel as the analysis
+surface with Sheets as the monitor; disposition shown as `<no history>` before the cutover
+rather than approximated. **The pipeline never writes to LSQ.**
+
+**Three findings set the architecture:**
+
+1. **LSQ has a native Webhooks feature and this repo did not know it.** `memory/07` recorded
+   the Webhooks API as "not used" and the automation spec said webhooks needed a hosted
+   endpoint — both true of the *Automation* subsystem, not this one. It **fires on
+   telephony-created activities**, which gotcha 11 gave good reason to doubt.
+2. **The payload is complete** — id, lead, actor, timestamp, status, duration, note blob. No
+   callback ⇒ no queue ⇒ no worker. Deleted ~800 lines of an earlier Supabase design.
+3. **But a Sheet cannot be the store.** At 1,169 calls/day, Apps Script's read-everything
+   refresh stops finishing inside the 6-minute limit at ~50–100k rows — two months. And there
+   is no bulk activity read, so unrecorded history is gone for good.
+
+**The recoverability split**, which governs how every number is read:
+
+| Signal | Historical | Forward |
+|---|---|---|
+| Calls per rep per day, connected | **Exact** (trails) | Exact |
+| **Stage at time of call** | **Exact** — 3002 carries Previous/Current + timestamp | Exact |
+| **Disposition at time of call** | **Unrecoverable** — lead field, no history kept | **Exact**, via field-change webhooks |
+
+**Built and verified:** 6 Supabase migrations; `CallingPipeline.gs` (ingest, enrichment,
+reporting, 6 hygiene flags, pivot); 4 PowerShell tools (webhook management, QC, backfill,
+oracle); **44 tests passing against real captured payloads**. `scripts/lib/activity.ps1`
+consolidates the per-lead block that was copy-pasted six times, two copies missing retry.
+
+**Gotchas 14–20 in `CLAUDE.md`** all came from this build. The expensive ones: millisecond
+timestamps on `ProspectActivityDate_Max` only (a null date reads as an empty day, not an
+error); a placeholder defeating its own `coalesce` fallback (980 calls onto one row);
+`Webhook.svc` needing `ActivityEvent` at the top level and `Delete` as a **GET**; and
+PostgREST demanding identical key sets across a bulk insert.
+
+**Backfill:** 15,972 contacts touched since 1 Aug, **8,297 excluded as Callkaro-only (52%)**,
+7,675 to pull over two nights. Checkpointed and resumable.
+
+**Still open:**
+- **Notes remain uncaptured** — reports the *what*, not the *why*. EventCode 203 is no longer
+  dead (last activity on 806 leads), making its fields mandatory the cheapest route.
+- 281 field-change events captured before the handler existed sit unimported in `Unparsed`.
+- Lead Stage Change (webhook event 5) cannot be created via API — worked around with a
+  field-change webhook on `ProspectStage`.
+- Apps Script cannot read request headers, so the receiver uses a query-string secret.
+  Obscurity, not a credential; acceptable because the endpoint only writes rows it was handed.
 
 ---
 
