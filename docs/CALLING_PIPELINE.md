@@ -256,6 +256,13 @@ needs a mapping line in the ingest, not a redesign, and history stays continuous
 
 - A call counts for a rep only when the dialler is the lead's **current** owner. Contacts are
   reassigned constantly; without this a rep inherits the previous owner's whole history.
+  Calls that fail the test are **bucketed as `<inherited: not the owner>`**, not dropped — so
+  team totals still reconcile against `fact_call` and the volume stays visible. This rule was
+  computed but not applied until migration `011`; it had been mis-crediting 9.9% of calls.
+- **Never use `ProspectActivityName_Max` as a hard exclusion.** It holds one value — the last
+  activity — so filtering the AI dialler out with it silently discards real rep calls on any
+  contact the dialler touched afterwards. `backfill.ps1` did this until 2026-08-09;
+  `-SkipAiOnly` still offers it and is documented as lossy.
 - **EventCode 208 (Callkaro AI dialler) is dropped entirely.** It appeared on 40 of 971
   assigned contacts, 14 of which no rep had ever called.
 - Inbound (21) counted separately from outbound reach.
@@ -266,10 +273,23 @@ needs a mapping line in the ingest, not a redesign, and history stays continuous
 ## 6. Verification
 
 ```powershell
-deno run --allow-read --no-check scripts/pipeline/test-calling-pipeline.ts   # 44 tests
+deno run --allow-read --no-check scripts/pipeline/test-calling-pipeline.ts   # 57 tests
 pwsh ./scripts/pipeline/02-qc-today.ps1                                      # vs the live API
 pwsh ./scripts/pipeline/verify-against-oracle.ps1 -TargetDate 2026-08-07     # rep-by-rep diff
+pwsh ./scripts/pipeline/06-diff-rep-day.ps1 -Rep "Akshita Sharma" -TargetDate 2026-08-07
 ```
+
+**When the oracle reports a rep off by N, use `06-diff-rep-day.ps1`** — it lists the actual
+activity ids on each side. It pages that rep's book, narrows in memory to leads active since
+the target day, and only then spends one call per trail: 340 calls to explain a two-call gap,
+against 4,834 to re-run the oracle. Narrow before you spend; scanning a 9,000-lead book is more
+expensive than the whole-team check it is meant to be cheaper than.
+
+**The oracle earns its cost.** Its 2026-08-09 run against 7 August disagreed by one call in
+2,249 — and both halves of that gap were real bugs that nothing inside the pipeline could see:
+a hard exclusion on `ProspectActivityName_Max` dropping real calls, and the owner-attribution
+rule being computed but never applied. Both were *shrinking* over time, so checking only a
+recent day nearly missed them. See `memory/12` for the write-ups.
 
 `verify-against-oracle.ps1` recounts a day straight from the LSQ API — deliberately without
 reusing the pipeline's normaliser — and diffs `v_rep_day` per rep. It is the check that

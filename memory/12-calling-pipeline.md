@@ -148,6 +148,59 @@ on the dropdown and was never applied. Same failure mode as the contact-stage dr
 2026-08-08 — a migration recorded as complete, with live records still on the old value.
 `v_deal_stage_drift` and QC check 10 now watch it.
 
+## Two defects the oracle caught, 2026-08-09
+
+Run against 2026-08-07: **2,249 (LSQ) vs 2,248 (pipeline)**, 13 of 15 reps exact. A 0.04% gap,
+and both halves of it turned out to be real bugs rather than noise. This is the whole argument
+for the oracle existing — neither would have been visible from inside the pipeline, and both
+were *shrinking* over time, so checking a recent day nearly missed them.
+
+### 1. `ProspectActivityName_Max` used as a hard exclusion (the one CLAUDE.md forbids)
+
+`backfill.ps1` skipped every contact whose `ProspectActivityName_Max` was the Callkaro
+activity — ~41% of touch volume, so a large budget saving. But that field holds **one** value,
+the last activity. A contact a rep called at 10:29 and the AI dialler touched at 15:00 reads
+as "AI-dialler-only" and its real calls go with it.
+
+Caught as *Akshita Sharma: LSQ 185, pipeline 183*. Both missing calls were connects — 25s and
+31s — on contacts the AI dialler happened to touch later the same day. Neither lead existed in
+`dim_contact` at all; the backfill had never considered them.
+
+Sized rather than guessed: a random 150-contact sample of the 8,297 excluded found **1.3% with
+an owner-attributed rep call**, extrapolating to ~166 missing calls. Small, but silent and
+unbounded — nothing in the filter caps how bad it gets on a day the dialler runs late.
+
+The exclusion is now **off by default**, available as `-SkipAiOnly` and documented as lossy.
+Cost of correctness: 8,297 extra trail pulls for the August window, one time.
+
+### 2. The owner-attribution rule was computed and then ignored
+
+`v_call_enriched` has always computed `is_owner_call` (dialler = current owner). **Nothing
+downstream used it.** `v_contact_day` and `v_pivot_disposition` both grouped on
+`coalesce(contact_owner_name, actor_name)` — bucketing a call by who *owns* the contact
+regardless of who *dialled* it. So every call a previous owner made on a since-reassigned lead
+was credited to whoever inherited it.
+
+**1,266 of 12,837 outbound calls (9.9%)** were attributed to someone who did not make them,
+concentrated in the reassignment window: 493 on 1 August, decaying to 1–3/day by the 7th. That
+decay is why the oracle registered it as a single call on Mayank Arora. Against 1 August the
+disagreement would have been 493.
+
+Migration `011` routes all three per-rep views through one `call_rep()` function and buckets
+non-owner calls as `<inherited: not the owner>` rather than dropping them — totals still
+reconcile against `fact_call`, no rep is credited with work they did not do, and the volume
+stays visible instead of being silently deleted.
+
+### The cheap diff tool this produced
+
+`scripts/pipeline/06-diff-rep-day.ps1` turns "off by 2" into two activity ids. It pages the
+rep's book (a few calls), narrows in memory to leads active since the target day, and only then
+spends one call per trail — 340 calls for Akshita instead of the oracle's 4,834.
+
+Its first version scanned the owner's whole book and was killed after 1,400 calls: for a rep
+holding 8,935 leads that is more expensive than the whole-team oracle it exists to be cheaper
+than. Narrow before you spend.
+
 ## Still open
 
 - **Notes remain uncaptured** — `CallNotes` empty on every payload, confirming

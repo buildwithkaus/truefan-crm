@@ -44,7 +44,12 @@ param(
     # already been loaded, so those rows have calls and stage history but no deals. Rather
     # than re-pull all 4,000, this scopes to Prospect and Customer contacts - the only ones
     # that can own an opportunity - which is roughly 1,000 calls instead of 4,000.
-    [switch]$DealStagesOnly
+    [switch]$DealStagesOnly,
+
+    # Skip contacts whose LAST activity is the Callkaro AI dialler. Cheaper, and LOSSY -
+    # ProspectActivityName_Max holds one value, so a contact a rep called earlier the same
+    # day is dropped along with its real calls. Off by default. See the block below.
+    [switch]$SkipAiOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -117,19 +122,41 @@ $candidates = $all.ToArray()
 Write-LsqLog "Contacts touched since $FromDate : $($candidates.Count)" $logPath
 if ($candidates.Count -eq 0) { throw "Zero candidates - refusing to report a clean empty run." }
 
-# Skip contacts whose only recent activity is the Callkaro AI dialler: it is ~41% of all
-# lead-touch volume and contributes nothing to rep metrics, so pulling those trails would
-# burn a large share of the daily API budget for data discarded on arrival.
+# ---------------------------------------------------------------------------------------
+# AI-dialler exclusion - OFF by default since 2026-08-09, and it must stay that way.
+#
+# It used to be unconditional: any contact whose ProspectActivityName_Max was the Callkaro
+# activity was dropped, on the reasoning that the AI dialler is ~41% of touch volume and
+# contributes nothing to rep metrics.
+#
+# ProspectActivityName_Max holds ONE value - the LAST activity. So a contact a rep called at
+# 10:29 and Callkaro touched at 15:00 reads as "AI-dialler-only" and its real rep calls are
+# dropped with it. This is exactly the hard exclusion gotcha 14 forbids, and it was caught by
+# the oracle: Akshita Sharma showed 183 against LSQ's 185 on 2026-08-07, and both missing
+# calls were 25s and 31s connects on contacts the AI dialler happened to touch later.
+#
+# Measured, not assumed: a random 150-contact sample of the 8,297 excluded found 1.3% with an
+# owner-attributed rep call, extrapolating to roughly 166 missing calls across the window.
+# Small, but silent and unbounded - nothing about the filter caps how bad it can get on a day
+# the AI dialler runs late.
+#
+# -SkipAiOnly restores the old behaviour for a deliberately cheap pass. It is lossy. Do not
+# use it for a run whose numbers will be published.
 $before = $candidates.Count
 if ($DealStagesOnly) {
-    # No AI exclusion here. The point of this pass is to capture the deal on EVERY
-    # deal-stage contact, and a contact whose most recent touch happens to be the AI dialler
-    # still owns its opportunity. Excluding it would leave a hole in the deal board.
+    # The point of this pass is to capture the deal on EVERY deal-stage contact, and a
+    # contact whose most recent touch happens to be the AI dialler still owns its
+    # opportunity. Excluding it would leave a hole in the deal board.
     $scoped = $candidates
-    Write-LsqLog "Deal-stage mode: AI-dialler exclusion skipped, all $before contacts in scope" $logPath
-} else {
+    Write-LsqLog "Deal-stage mode: all $before contacts in scope" $logPath
+} elseif ($SkipAiOnly) {
     $scoped = @($candidates | Where-Object { "$($_.ProspectActivityName_Max)" -ne $Script:AI_ACTIVITY_NAME })
-    Write-LsqLog "Excluded $($before - $scoped.Count) AI-dialler-only contacts" $logPath
+    Write-LsqLog "LOSSY: skipped $($before - $scoped.Count) contacts whose LAST activity is the AI dialler." $logPath
+    Write-LsqLog "       Some of them carry real rep calls. Do not publish numbers from this run." $logPath
+} else {
+    $scoped = $candidates
+    $aiLast = @($candidates | Where-Object { "$($_.ProspectActivityName_Max)" -eq $Script:AI_ACTIVITY_NAME }).Count
+    Write-LsqLog "All $before contacts in scope ($aiLast have an AI-dialler last activity, kept deliberately)" $logPath
 }
 
 $done = @{}
