@@ -144,6 +144,17 @@ new script. One line each:
 22. PowerShell **aliases outrank functions**. A helper named `Del` is silently shadowed by
     the built-in `del` → `Remove-Item`, so every call tries to delete a file path. Same
     family as `$pid`: use approved verbs (`Remove-LsqWebhook`), never a short alias-like name.
+23. **`GetOpportunitiesOfLead` is a POST with an empty body** (a GET returns 405) and there is
+    **no `/Opportunity/` path segment** — `OpportunityManagement.svc/GetOpportunitiesOfLead`,
+    not `.../Opportunity/GetOpportunitiesOfLead`. The wrong path 404s on every method, which
+    reads as "the endpoint does not exist" rather than "the URL is wrong". **No opportunity
+    field-metadata endpoint exists** (14 candidates probed; only `GetOpportunityTypes`
+    answers, and its `Fields` is null) — the only way to learn the opportunity schema is to
+    read a real opportunity.
+24. **The Opportunity object carries only four custom fields** on this account:
+    `mx_Custom_1` (deal name), `mx_Custom_2` (deal stage), and `mx_Custom_6`/`mx_Custom_8`,
+    both empty and unnamed. **There is no deal-value or expected-close-date field** — absent,
+    not blank. Any forecast work starts with creating them in the LSQ UI.
 
 Plus: **no bulk Opportunity read endpoint and no bulk Activity read endpoint exist** — both cost
 one API call per lead, so always narrow to a candidate set first. **No Notes API exists** either.

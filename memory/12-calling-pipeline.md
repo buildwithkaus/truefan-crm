@@ -103,6 +103,51 @@ but it is a **floor, not the truth**: a rep calls a lead at 10:00, Callkaro touc
 When a QC number disagrees with the pipeline, check the QC scope before assuming the pipeline
 is wrong.
 
+## The Opportunity object has no deal-value and no close-date field (2026-08-09)
+
+Enumerated live across 23 real opportunities via
+`OpportunityManagement.svc/GetOpportunitiesOfLead` — 66 properties, of which exactly **four**
+are custom fields:
+
+| Field | Holds | Filled |
+|---|---|---|
+| `mx_Custom_1` | Deal name | 23 / 23 |
+| `mx_Custom_2` | Deal stage | 23 / 23 |
+| `mx_Custom_6` | *nothing, no display name* | 0 / 23 |
+| `mx_Custom_8` | *nothing, no display name* | 0 / 23 |
+
+**There is no deal-value field and no expected-closure-date field. Not blank — absent.**
+
+This reframes the forecast gap completely. It had been understood as reps not filling the
+fields in, which is a coaching problem; it is actually a missing field, which is a five-minute
+admin task. Chasing reps for it would have been chasing them for something impossible.
+
+The warehouse columns (`fact_opportunity.deal_value`, `expected_close_date`) and every
+forecast view are already written against them, so once the LSQ fields exist this is a mapping
+line in the ingest — not a schema change plus a re-ingest, which for opportunities costs one
+API call per lead.
+
+Two smaller findings from the same probe:
+
+- **`GetOpportunitiesOfLead` is a POST**, despite taking every parameter on the query string
+  and reading nothing from the body. A GET returns 405. There is **no `/Opportunity/` path
+  segment** — inserting one returns a clean 404 on every method, which reads exactly like "the
+  endpoint does not exist" rather than "the URL is wrong". Same family as gotcha 2: a
+  plausible-looking negative is not evidence.
+- **No opportunity field-metadata endpoint exists.** Fourteen candidates probed, all 404
+  except `GetOpportunityTypes`, which returns `Fields: null`. The only way to learn the
+  opportunity schema is to read a real opportunity.
+
+### Deal stages, enumerated live
+
+`Prospect` 117 · `Requirement Gathering` 15 · `In Discussion` 4. All 136 at status `Open`.
+
+`Requirement Gathering` is a **legacy value** that `scripts/lib/schema.ps1`
+(`OpportunityStageRenames`) specifies should have become `Prospect`. That rename is a UI edit
+on the dropdown and was never applied. Same failure mode as the contact-stage drift found on
+2026-08-08 — a migration recorded as complete, with live records still on the old value.
+`v_deal_stage_drift` and QC check 10 now watch it.
+
 ## Still open
 
 - **Notes remain uncaptured** — `CallNotes` empty on every payload, confirming

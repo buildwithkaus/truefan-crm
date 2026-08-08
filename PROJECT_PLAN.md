@@ -451,7 +451,48 @@ PostgREST demanding identical key sets across a bulk insert.
 **Backfill:** 15,972 contacts touched since 1 Aug, **8,297 excluded as Callkaro-only (52%)**,
 7,675 to pull over two nights. Checkpointed and resumable.
 
+### 10b — The opportunity funnel and the forecast (2026-08-09)
+
+Extends the pipeline past `Prospect` into the deal, which is where revenue is. Migration
+`010`; tabs **Rep Funnel**, **Prospects Daily**, **Deal Board**, **Forecast**, **QC**.
+
+`Fresh → Engaged → Prospect → (opportunity) → Won | Lost`, with `Disqualified` as an exit at
+any point. Prospects created is counted from **stage transitions, not current stage** — a
+contact promoted Tuesday and disqualified Thursday still counts for Tuesday — and attributed
+**actor-first**, so bulk and admin writes appear as their own column instead of inflating a
+rep's production.
+
+**The finding that changes the framing.** The forecast gap had been understood as reps not
+filling in deal size and close date. It is not: the live Opportunity object has 66 properties
+and **four** custom fields — `mx_Custom_1` (name), `mx_Custom_2` (stage), and
+`mx_Custom_6`/`mx_Custom_8`, both empty and unnamed. **There is no deal-value field and no
+expected-closure-date field. Absent, not blank.** Nobody can fill in a field that does not
+exist, so this is an admin task, not a coaching one. The warehouse columns and every forecast
+view are already written against them; creating the LSQ fields makes the tab work with no
+further code change.
+
+The Forecast tab therefore leads with **forecast coverage** rather than a forecast, and states
+plainly which of the two situations it is in. `Est. value we cannot see` is labelled
+everywhere as the size of the blind spot, not a prediction.
+
+Also found: **15 of 136 opportunities still sit on the legacy deal stage `Requirement
+Gathering`**, a rename the 2026-07-31 restructure specified but never applied to the dropdown
+— the same failure mode as the contact-stage drift found the day before. `v_deal_stage_drift`
+and QC check 10 now watch it.
+
+**QC is now a tab.** Twelve checks inside the warehouse, each against something that does not
+share its arithmetic, rendered with expected vs actual, plus a data-boundaries block stating
+what each stream physically cannot know. `FAIL` means a number in the workbook is wrong.
+
+**Ready for what is coming next week:** `fact_call` already carries nullable `disposition`,
+`transcript` and `transcript_url` columns, and `v_call_disposition_at_time` already prefers a
+real per-call disposition over the 12-hour inference. Adding a nullable column to an
+8,000-row table is instant; retrofitting after 200,000 rows, with a re-ingest costing one API
+call per lead, is not.
+
 **Still open:**
+- **Deal value and expected closure date must be created on the LSQ Opportunity object.**
+  Nothing else blocks the forecast.
 - **Notes remain uncaptured** — reports the *what*, not the *why*. EventCode 203 is no longer
   dead (last activity on 806 leads), making its fields mandatory the cheapest route.
 - 281 field-change events captured before the handler existed sit unimported in `Unparsed`.

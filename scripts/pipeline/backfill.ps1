@@ -217,9 +217,26 @@ function Invoke-SbUpsert {
         apikey = $sbKey; Authorization = "Bearer $sbKey"
         Prefer = "resolution=merge-duplicates,return=minimal"
     }
+    # PostgREST puts the ACTUAL cause in the response body - "column X does not exist",
+    # "value too long", the offending row. Invoke-RestMethod throws away the body on a 4xx/5xx
+    # and leaves only "(500) Internal Server Error", which is unactionable and sent an earlier
+    # run into three blind retries. Read the error stream before rethrowing.
     [void](Invoke-LsqWithRetry -What "upsert $Table" -Action {
-        Invoke-RestMethod -Uri "$sbUrl/rest/v1/$Table" -Method Post -Body $bytes `
-            -Headers $headers -ContentType "application/json; charset=utf-8" -ErrorAction Stop
+        try {
+            Invoke-RestMethod -Uri "$sbUrl/rest/v1/$Table" -Method Post -Body $bytes `
+                -Headers $headers -ContentType "application/json; charset=utf-8" -ErrorAction Stop
+        } catch {
+            $detail = $_.ErrorDetails.Message
+            if (-not $detail -and $_.Exception.Response) {
+                try {
+                    $stream = $_.Exception.Response.GetResponseStream()
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    $detail = $reader.ReadToEnd()
+                    $reader.Close()
+                } catch { $detail = "<could not read error body>" }
+            }
+            throw "upsert $Table failed: $($_.Exception.Message) :: $detail"
+        }
     })
     return $Rows.Count
 }
@@ -310,6 +327,32 @@ foreach ($lead in $todo) {
             continue
         }
 
+        if ($code -eq $Script:EVENT_OPPORTUNITY -or $code -eq $Script:EVENT_OPP_CAPTURED) {
+            # Unbounded by date, like stage changes, and it MUST sit above the window gate
+            # below. It did not until 2026-08-09: the gate came first, so every opportunity
+            # created before -FromDate was dropped while the comment here claimed otherwise.
+            # Phase 3 created 4,404 opportunities in July, and the deal board was showing 254
+            # - a board that looked plausible, was internally consistent, and was missing
+            # almost everything. A deal opened in July is still the live deal on an August
+            # contact; its creation date is not the reporting window.
+            #
+            # Shape confirmed live 2026-08-08: mx_Custom_1 is the opportunity NAME,
+            # mx_Custom_2 is the DEAL STAGE, Status is the native Open/Won/Lost.
+            $af = $a.ActivityFields
+            [void]$opportunities.Add([ordered]@{
+                activity_id      = (Get-LsqActivityId $a)
+                prospect_id      = $leadId
+                opportunity_name = "$($af.mx_Custom_1)"
+                stage            = "$($af.mx_Custom_2)"
+                status           = "$($af.Status)"
+                owner_id         = "$($af.Owner)"
+                created_at_utc   = (ConvertTo-IsoUtc $when)
+                modified_at_utc  = (ConvertTo-IsoUtc (ConvertFrom-LsqUtc "$($a.ModifiedOn)"))
+                ingest_source    = "backfill"
+            })
+            continue
+        }
+
         if ($when -lt $fromUtc) { continue }
 
         if ($code -eq $Script:EVENT_CALL_OUTBOUND -or $code -eq $Script:EVENT_CALL_INBOUND) {
@@ -330,26 +373,6 @@ foreach ($lead in $todo) {
                 recording_url = "$($a.ActivityFields.mx_Custom_4)"
                 ingest_source = "backfill"
             })
-        }
-        elseif ($code -eq $Script:EVENT_OPPORTUNITY -or $code -eq $Script:EVENT_OPP_CAPTURED) {
-            # Shape confirmed live 2026-08-08: mx_Custom_1 is the opportunity NAME,
-            # mx_Custom_2 is the DEAL STAGE, and Status is the native Open/Won/Lost.
-            # Unbounded by date, like stage changes - a deal opened in July is still the
-            # live deal on an August contact, and excluding it would make the deal board
-            # look emptier than the account actually is.
-            $af = $a.ActivityFields
-            [void]$opportunities.Add([ordered]@{
-                activity_id      = (Get-LsqActivityId $a)
-                prospect_id      = $leadId
-                opportunity_name = "$($af.mx_Custom_1)"
-                stage            = "$($af.mx_Custom_2)"
-                status           = "$($af.Status)"
-                owner_id         = "$($af.Owner)"
-                created_at_utc   = (ConvertTo-IsoUtc $when)
-                modified_at_utc  = (ConvertTo-IsoUtc (ConvertFrom-LsqUtc "$($a.ModifiedOn)"))
-                ingest_source    = "backfill"
-            })
-            continue
         }
         elseif ($code -eq $Script:EVENT_CALL_FORM) {
             $af = $a.ActivityFields

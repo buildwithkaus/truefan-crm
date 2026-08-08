@@ -161,3 +161,71 @@ fcheck("no timestamp -> none", modFC.normalizeFieldChange_({
 console.log("");
 console.log(fcFail === 0 ? "FIELD-CHANGE TESTS PASSED" : `*** ${fcFail} FIELD-CHANGE FAILURE(S) ***`);
 if (fcFail > 0) Deno.exit(1);
+
+
+// =========================================================================================
+// buildMatrix_ - the pivot behind Prospects Daily and the Deal Board stage grid.
+//
+// Worth testing rather than eyeballing: it is the only place in the file that invents column
+// keys, and a collision there silently overwrites a rep's column with another rep's numbers.
+// =========================================================================================
+const modM = new Function(stub + src + `return { buildMatrix_ };`)();
+
+let mFail = 0;
+function mcheck(label: string, actual: unknown, expected: unknown) {
+  if (String(actual) === String(expected)) console.log(`  OK   ${label} = ${actual}`);
+  else { console.log(`  FAIL ${label} = ${actual}  (want ${expected})`); mFail++; }
+}
+
+console.log("");
+console.log("=========================================================");
+console.log("buildMatrix_");
+console.log("=========================================================");
+
+const MROWS = [
+  { d: "2026-08-08", rep: "Rishi",    n: 3 },
+  { d: "2026-08-08", rep: "Abhishek", n: 5 },
+  { d: "2026-08-07", rep: "Rishi",    n: 2 },
+  { d: "2026-08-07", rep: "Mayank",   n: 1 }
+];
+
+console.log("--- shape and totals ---");
+const m1 = modM.buildMatrix_(MROWS, "d", "rep", "n");
+mcheck("row count", m1.rows.length, 2);
+mcheck("grand total", m1.grand, 11);
+// Columns are ordered by their own total descending: Abhishek 5, Rishi 5, Mayank 1. Abhishek
+// and Rishi tie, so only the last position is asserted - a tie-break is not a contract.
+mcheck("busiest column is not last", m1.cols[2], "Mayank");
+mcheck("total row grand", m1.totalRow._total, 11);
+
+console.log("--- a zero renders blank, not 0 ---");
+// Mayank has nothing on the 8th. A grid of literal zeroes is unreadable and makes a genuine
+// zero indistinguishable from a rep who was not working that day.
+const aug8 = m1.rows.filter((r: any) => r._row === "2026-08-08")[0];
+const mayankCol = "c" + m1.cols.indexOf("Mayank");
+mcheck("empty cell is blank", JSON.stringify(aug8[mayankCol]), '""');
+mcheck("row total still correct", aug8._total, 8);
+
+console.log("--- a rep literally called 'Total' does not collide ---");
+// Column keys are positional (c0, c1, ...) precisely so a rep name can never overwrite the
+// _total column. Using the name as the key would silently destroy the row total here.
+const m2 = modM.buildMatrix_(
+  [{ d: "2026-08-08", rep: "Total", n: 4 }, { d: "2026-08-08", rep: "Rishi", n: 6 }],
+  "d", "rep", "n");
+mcheck("row total survives", m2.rows[0]._total, 10);
+mcheck("two real columns", m2.cols.length, 2);
+
+console.log("--- duplicate cells accumulate rather than overwrite ---");
+const m3 = modM.buildMatrix_(
+  [{ d: "x", rep: "A", n: 2 }, { d: "x", rep: "A", n: 3 }], "d", "rep", "n");
+mcheck("summed", m3.rows[0].c0, 5);
+
+console.log("--- empty input ---");
+const m4 = modM.buildMatrix_([], "d", "rep", "n");
+mcheck("no rows", m4.rows.length, 0);
+mcheck("no columns", m4.cols.length, 0);
+mcheck("grand zero", m4.grand, 0);
+
+console.log("");
+console.log(mFail === 0 ? "MATRIX TESTS PASSED" : `*** ${mFail} MATRIX FAILURE(S) ***`);
+if (mFail > 0) Deno.exit(1);

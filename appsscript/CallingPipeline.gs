@@ -32,17 +32,35 @@
  * ---------------------------------------------------------------------------------------
  */
 
+// Tab order here is the tab order in the workbook - TAB_ORDER below drives an actual
+// reorder on every refresh, because a sheet whose tabs wander is a sheet nobody trusts.
+// Grouped: today's activity, then what each rep holds, then the deal funnel, then plumbing.
 var TABS = {
   DASHBOARD: 'Dashboard',
-  PIPELINE: 'Pipeline State',
   REP_DAY: 'Rep Day',
   TREND: 'Daily Trend',
-  FUNNEL: 'Funnel',
+  PIPELINE: 'Pipeline State',
+  REP_FUNNEL: 'Rep Funnel',
+  PROSPECTS: 'Prospects Daily',
+  FUNNEL: 'Stage Movement',
+  DEALS: 'Deal Board',
+  FORECAST: 'Forecast',
   EXCEPTIONS: 'Exceptions',
-  PROSPECTS: 'Prospects',
+  QC: 'QC',
   META: 'Meta',
   PENDING: 'Pending',      // webhook rows Supabase refused; retried by trigger
   UNPARSED: 'Unparsed'     // payload shapes the parser did not recognise
+};
+
+// Colour-coded by what the tab answers, so the tab strip itself is navigable:
+// blue = calling activity, green = the book and the funnel, amber = things to fix,
+// grey = plumbing.
+var TAB_COLOR = {
+  'Dashboard': '#1f3864', 'Rep Day': '#1f3864', 'Daily Trend': '#1f3864',
+  'Pipeline State': '#188038', 'Rep Funnel': '#188038', 'Prospects Daily': '#188038',
+  'Stage Movement': '#188038', 'Deal Board': '#0b8043', 'Forecast': '#0b8043',
+  'Exceptions': '#c5221f', 'QC': '#e37400',
+  'Meta': '#80868b', 'Pending': '#80868b', 'Unparsed': '#80868b'
 };
 
 var IST_OFFSET_MS = 330 * 60 * 1000;
@@ -545,14 +563,23 @@ function refreshReports() {
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) return;
   try {
-    writeDashboard_();
-    writePipelineState_();
-    writeRepDay_();
-    writeTrend_();
-    writeFunnel_();
-    writeExceptions_();
-    writeProspects_();
-    writeMeta_();
+    // Each tab is wrapped so one failing view - a migration not yet run, a renamed column -
+    // cannot take the whole refresh down and leave every other tab stale. The failure is
+    // written onto the tab it belongs to, where someone will actually see it.
+    var tabs = [
+      ['Dashboard', writeDashboard_], ['Pipeline State', writePipelineState_],
+      ['Rep Day', writeRepDay_], ['Daily Trend', writeTrend_],
+      ['Stage Movement', writeFunnel_], ['Exceptions', writeExceptions_],
+      ['Prospects Daily', writeProspectsDaily_], ['Rep Funnel', writeRepFunnel_],
+      ['Deal Board', writeDeals_], ['Forecast', writeForecast_], ['QC', writeQc_]
+    ];
+    var failures = [];
+    for (var i = 0; i < tabs.length; i++) {
+      try { tabs[i][1](); }
+      catch (e) { failures.push(tabs[i][0] + ': ' + e); }
+    }
+    writeMeta_(failures);
+    orderTabs_();
   } finally {
     lock.releaseLock();
   }
@@ -861,27 +888,491 @@ function writeExceptions_() {
      ['disqualification_reason', 'Disq Reason'], ['dials', 'Dials'], ['connects', 'Connects'],
      ['prospect_id', 'ProspectId']],
     rows, 'The worklist. One row per violation, severity 1 first.');
+  // Body starts at row 4 (title 1, subtitle 2, header 3). The range and the formula's row
+  // reference must BOTH start there - anchoring at row 3 covered the header and stopped one
+  // row short of the last exception, so the worst row on the tab was never coloured.
   if (rows.length) {
+    var band = sh.getRange(4, 1, rows.length, 14);
     sh.setConditionalFormatRules([
-      SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied('=$D3=1')
-        .setBackground('#fce8e6').setRanges([sh.getRange(3, 1, rows.length, 14)]).build(),
-      SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied('=$D3=2')
-        .setBackground('#fef7e0').setRanges([sh.getRange(3, 1, rows.length, 14)]).build()
+      SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied('=$D4=1')
+        .setBackground(THEME.bad).setRanges([band]).build(),
+      SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied('=$D4=2')
+        .setBackground(THEME.warn).setRanges([band]).build()
     ]);
   }
 }
 
-function writeProspects_() {
-  var rows = sbSelect_('v_funnel_movement',
-    'select=*&to_stage=eq.Prospect&report_date=gte.' + istDaysAgo_(30) + '&order=report_date.desc', 2000);
-  writeTable_(TABS.PROSPECTS,
-    [['report_date', 'Date'], ['rep', 'Promoted by'], ['from_stage', 'From stage'],
-     ['contacts', 'Contacts']],
-    rows, 'Contacts promoted to Prospect. Sourced from stage-change history, so it is only ' +
-          'as complete as the backfill and the stage-change webhook.');
+/**
+ * PROSPECTS DAILY - the production number. Rows are days, columns are reps.
+ *
+ * A matrix rather than a list because the question is comparative: who is creating prospects
+ * and on which days did the team stall. A 400-row long-format list cannot be read that way,
+ * and pivoting it by hand is exactly the manual step this pipeline exists to remove.
+ *
+ * "Created" means a stage TRANSITION into Prospect, so a contact later disqualified still
+ * counts on the day it was promoted. Reading current stage instead would delete a rep's
+ * work retroactively every time a deal went bad.
+ */
+function writeProspectsDaily_() {
+  var rows = sbSelect_('v_prospects_daily',
+    'select=*&report_date=gte.' + istDaysAgo_(29) + '&order=report_date.desc', 5000);
+
+  var sh = ensureSheet_(TABS.PROSPECTS);
+  sh.clear();
+  clearBandings_(sh);
+  sh.setHiddenGridlines(true);
+
+  if (!rows.length) {
+    renderTable_(sh, 1, TABS.PROSPECTS, [['report_date', 'Date']], [],
+      'No stage transitions into Prospect in the last 30 days.');
+    return;
+  }
+
+  var m = buildMatrix_(rows, 'report_date', 'rep', 'prospects_created');
+  var colDefs = [['_row', 'Date (IST)']];
+  for (var i = 0; i < m.cols.length; i++) colDefs.push(['c' + i, m.cols[i]]);
+  colDefs.push(['_total', 'Total']);
+
+  var netNew = 0, reEntered = 0, total = 0;
+  for (var j = 0; j < rows.length; j++) {
+    netNew    += Number(rows[j].net_new) || 0;
+    reEntered += Number(rows[j].re_entered) || 0;
+    total     += Number(rows[j].prospects_created) || 0;
+  }
+
+  var r = renderKpis_(sh, 1, [
+    { label: 'Prospects created (30d)', value: total, format: '#,##0' },
+    { label: 'First-time', value: netNew, format: '#,##0' },
+    { label: 'Re-entered', value: reEntered, format: '#,##0',
+      color: reEntered > 0 ? '#b06000' : null },
+    { label: 'Active days', value: m.rowKeys.length, format: '#,##0' },
+    { label: 'Reps creating', value: m.cols.length, format: '#,##0' }
+  ]);
+
+  renderTable_(sh, r, 'Prospects created per day, per rep',
+    colDefs, m.rows.concat([m.totalRow]),
+    'A stage transition into Prospect, credited to the contact owner. Re-entries (a contact ' +
+    'that was already a Prospect before) are counted in the total but broken out above, ' +
+    'because they are recovered pipeline rather than new pipeline.',
+    { freeze: true, totalRow: m.rows.length });
+
+  autoWidth_(sh, colDefs, m.rows);
+  sh.setColumnWidth(1, 110);
 }
 
-function writeMeta_() {
+/**
+ * Pivot long-format rows into a matrix. Column keys are positional ('c0','c1',...) rather
+ * than the label itself, so a rep called "Total" cannot collide with the total column and a
+ * name containing a dot cannot break a property lookup.
+ *
+ * Columns are ordered by their own total descending - the busiest rep first - which is what
+ * a reader scans for. Alphabetical would bury the answer.
+ */
+function buildMatrix_(rows, rowKey, colKey, valKey) {
+  var colTotals = {}, rowMap = {}, rowKeys = [];
+  for (var i = 0; i < rows.length; i++) {
+    var rk = String(rows[i][rowKey]);
+    var ck = String(rows[i][colKey]);
+    var v = Number(rows[i][valKey]) || 0;
+    if (!rowMap[rk]) { rowMap[rk] = {}; rowKeys.push(rk); }
+    rowMap[rk][ck] = (rowMap[rk][ck] || 0) + v;
+    colTotals[ck] = (colTotals[ck] || 0) + v;
+  }
+  var cols = Object.keys(colTotals).sort(function (a, b) { return colTotals[b] - colTotals[a]; });
+
+  var out = [], grand = 0;
+  var totalRow = { _row: 'TOTAL' };
+  for (var c = 0; c < cols.length; c++) totalRow['c' + c] = colTotals[cols[c]];
+  for (var k = 0; k < rowKeys.length; k++) {
+    var o = { _row: rowKeys[k] }, sum = 0;
+    for (var c2 = 0; c2 < cols.length; c2++) {
+      var val = rowMap[rowKeys[k]][cols[c2]] || 0;
+      o['c' + c2] = val || '';   // blank, not 0 - a grid of zeroes hides the real numbers
+      sum += val;
+    }
+    o._total = sum;
+    grand += sum;
+    out.push(o);
+  }
+  totalRow._total = grand;
+  return { cols: cols, rows: out, rowKeys: rowKeys, totalRow: totalRow, grand: grand };
+}
+
+/**
+ * REP FUNNEL - book to closed deal, one row per rep.
+ *
+ * Deliberately starts from the assigned BOOK, not from contacts that have been touched. A
+ * funnel drawn only on touched contacts always looks healthy because the untouched majority
+ * is invisible; on this account that majority is most of the book (one rep is at 1.5%
+ * coverage). Book size and workable sit in the same row as the conversions so the gap
+ * cannot be read past.
+ */
+function writeRepFunnel_() {
+  var rows = sbSelect_('v_funnel_rep', 'select=*&order=workable.desc', 200);
+
+  var sh = writeTable_(TABS.REP_FUNNEL, [
+    ['rep', 'Rep'],
+    ['book_size', 'Book'],
+    ['workable', 'Workable'],
+    ['untouched_fresh', 'Still Fresh'],
+    ['in_journey', 'Touched'],
+    ['engaged', 'Engaged'],
+    ['prospect', 'Prospect'],
+    ['opportunities', 'Opps'],
+    ['won', 'Won'],
+    ['lost', 'Lost'],
+    ['disqualified', 'Disqualified'],
+    ['book_to_engaged_pct', 'Book>Engaged %'],
+    ['engaged_to_prospect_pct', 'Engaged>Prospect %'],
+    ['prospect_to_opp_pct', 'Prospect>Opp %'],
+    ['win_rate_pct', 'Win rate %']
+  ], rows,
+    'The whole funnel per rep. "Workable" is Fresh + Engaged + Prospect from today\'s book ' +
+    'snapshot. "Prospect>Opp %" below 100 means prospects exist with no opportunity behind ' +
+    'them - the operational rule says every Prospect should have one.');
+
+  // Amber where the funnel leaks at the step this team controls directly.
+  // Body starts at row 4: title 1, subtitle 2, header 3.
+  var bodyStart = 4;
+  for (var i = 0; i < rows.length; i++) {
+    var p2o = Number(rows[i].prospect_to_opp_pct);
+    if (Number(rows[i].prospect) > 0 && (isNaN(p2o) || p2o < 100)) {
+      sh.getRange(bodyStart + i, 14).setBackground(THEME.warn);
+    }
+    if (Number(rows[i].book_to_engaged_pct) < 10) {
+      sh.getRange(bodyStart + i, 12).setBackground(THEME.bad);
+    }
+  }
+  return sh;
+}
+
+/**
+ * DEAL BOARD - every opportunity, by rep, by status, by stage.
+ *
+ * Two blocks. The per-rep summary answers "how is each rep's deal book doing"; the stage
+ * matrix underneath answers "where do open deals actually sit". Stage names come from the
+ * data, never from a hardcoded list, so an invented stage shows up rather than vanishing.
+ */
+function writeDeals_() {
+  var board = sbSelect_('v_deal_board', 'select=*&order=open_opps.desc', 200);
+  var detail = sbSelect_('v_deal_stage_detail',
+    'select=*&status=eq.Open&order=stage_rank.asc', 2000);
+
+  var sh = ensureSheet_(TABS.DEALS);
+  sh.clear();
+  clearBandings_(sh);
+  sh.setHiddenGridlines(true);
+
+  if (!board.length) {
+    renderTable_(sh, 1, TABS.DEALS, [['rep', 'Rep']], [],
+      'No opportunities loaded yet. Run:  pwsh ./scripts/pipeline/backfill.ps1 -DealStagesOnly');
+    return;
+  }
+
+  var totOpen = 0, totWon = 0, totLost = 0, openValue = 0, wonValue = 0, unvalued = 0;
+  for (var i = 0; i < board.length; i++) {
+    totOpen   += Number(board[i].open_opps) || 0;
+    totWon    += Number(board[i].won) || 0;
+    totLost   += Number(board[i].lost) || 0;
+    openValue += Number(board[i].open_known_value) || 0;
+    wonValue  += Number(board[i].won_value) || 0;
+    unvalued  += Number(board[i].open_unvalued) || 0;
+  }
+
+  var r = renderKpis_(sh, 1, [
+    { label: 'Open deals', value: totOpen, format: '#,##0' },
+    { label: 'Won', value: totWon, format: '#,##0', color: '#188038' },
+    { label: 'Lost', value: totLost, format: '#,##0', color: '#c5221f' },
+    { label: 'Win rate', value: (totWon + totLost) ? (100 * totWon / (totWon + totLost)) : '',
+      format: '0.0"%"' },
+    { label: 'Open value (known)', value: openValue, format: '"₹"#,##0' },
+    { label: 'Open deals with no value', value: unvalued, format: '#,##0',
+      color: unvalued > 0 ? '#b06000' : null }
+  ]);
+
+  r = renderTable_(sh, r, 'Deal book per rep', [
+    ['rep', 'Rep'],
+    ['total_opps', 'Total'],
+    ['open_opps', 'Open'],
+    ['won', 'Won'],
+    ['lost', 'Lost'],
+    ['other_status', 'Other'],
+    ['win_rate_pct', 'Win rate %'],
+    ['open_known_value', 'Open value (known)'],
+    ['won_value', 'Won value'],
+    ['open_unvalued', 'Open, no value'],
+    ['open_no_close_date', 'Open, no close date']
+  ], board,
+    'Win rate is Won / (Won + Lost) - open deals are excluded from the denominator, ' +
+    'otherwise a rep with a healthy pipeline looks like they are losing.',
+    { freeze: true });
+
+  if (detail.length) {
+    var m = buildMatrix_(detail, 'rep', 'stage', 'opportunities');
+    var colDefs = [['_row', 'Rep']];
+    for (var c = 0; c < m.cols.length; c++) colDefs.push(['c' + c, m.cols[c]]);
+    colDefs.push(['_total', 'Open total']);
+    renderTable_(sh, r, 'Open deals by stage',
+      colDefs, m.rows.concat([m.totalRow]),
+      'Stage values are read from live data, not a fixed list. A stage you do not recognise ' +
+      'here is a value someone invented - it is invisible to LSQ stage filters.',
+      { freeze: false, totalRow: m.rows.length });
+  }
+
+  sh.setColumnWidth(1, 170);
+  for (var w = 2; w <= 12; w++) sh.setColumnWidth(w, 116);
+  return sh;
+}
+
+/**
+ * FORECAST - what is going to close, for how much, and when.
+ *
+ * The headline block is the point of this tab TODAY. Deal value and expected close date are
+ * blank on most opportunities, so the deal list below is mostly empty columns - and showing
+ * that emptiness as a percentage, per rep, is the entire argument for filling them in. A
+ * forecast that covers 8% of open deals is not a forecast, and this states it in one number
+ * rather than leaving someone to infer it from a sea of blanks.
+ *
+ * The list is still useful before a single amount is entered: days open, days since last
+ * call, overdue and stale work on every row regardless of value.
+ */
+function writeForecast_() {
+  var deals = sbSelect_('v_forecast',
+    'select=*&order=expected_close_date.asc.nullslast,days_open.desc', 3000);
+  var quality = sbSelect_('v_forecast_quality', 'select=*&order=open_opps.desc', 200);
+
+  var sh = ensureSheet_(TABS.FORECAST);
+  sh.clear();
+  clearBandings_(sh);
+  sh.setHiddenGridlines(true);
+
+  if (!deals.length) {
+    renderTable_(sh, 1, TABS.FORECAST, [['rep', 'Rep']], [],
+      'No open opportunities loaded. Run:  pwsh ./scripts/pipeline/backfill.ps1 -DealStagesOnly');
+    return;
+  }
+
+  var open = deals.length, forecastable = 0, valued = 0, dated = 0,
+      known = 0, overdue = 0, stale = 0;
+  for (var i = 0; i < deals.length; i++) {
+    var d = deals[i];
+    if (!d.missing_value) { valued++; known += Number(d.deal_value) || 0; }
+    if (!d.missing_close_date) dated++;
+    if (!d.missing_value && !d.missing_close_date) forecastable++;
+    if (d.overdue) overdue++;
+    if (d.stale) stale++;
+  }
+  var blind = 0;
+  for (var q = 0; q < quality.length; q++) blind += Number(quality[q].est_blind_value) || 0;
+  var fcPct = 100 * forecastable / open;
+
+  var r = renderKpis_(sh, 1, [
+    { label: 'Open deals', value: open, format: '#,##0' },
+    { label: 'Forecastable (value AND date)', value: forecastable, format: '#,##0',
+      color: forecastable === open ? '#188038' : '#c5221f' },
+    { label: 'Forecast coverage', value: fcPct, format: '0.0"%"',
+      color: fcPct >= 80 ? '#188038' : '#c5221f',
+      bg: fcPct >= 80 ? THEME.good : THEME.bad },
+    { label: 'Pipeline we can see', value: known, format: '"₹"#,##0' },
+    { label: 'Est. value we cannot see', value: blind || '', format: '"₹"#,##0',
+      color: '#b06000' },
+    { label: 'Overdue', value: overdue, format: '#,##0', color: overdue ? '#c5221f' : null },
+    { label: 'Stale (14d+ no call)', value: stale, format: '#,##0',
+      color: stale ? '#b06000' : null }
+  ]);
+
+  // The message has to distinguish two very different situations that look identical in the
+  // numbers. "Reps have not filled the field in" is a coaching problem. "The field does not
+  // exist in LSQ" is a five-minute admin task, and saying the first when it is the second
+  // sends people to chase reps for something they cannot do.
+  var msg, msgColor;
+  if (forecastable === open) {
+    msg = 'Every open deal carries a value and a close date. This forecast is complete.';
+    msgColor = '#188038';
+  } else if (valued === 0 && dated === 0) {
+    msg = 'None of the ' + open + ' open deals carry a value or a close date, because ' +
+          'THOSE FIELDS DO NOT EXIST on the LSQ Opportunity object - it has four custom ' +
+          'fields and two of them are unused and unnamed. This is not a rep-discipline gap: ' +
+          'nobody can fill in a field that has not been created. Create "Deal Value" ' +
+          '(currency) and "Expected Closure Date" (date) on the Opportunity, and this tab ' +
+          'starts forecasting with no further code change.';
+    msgColor = '#c5221f';
+  } else {
+    msg = 'Only ' + forecastable + ' of ' + open + ' open deals carry BOTH a deal value and ' +
+          'an expected close date, so ' + (open - forecastable) + ' cannot be forecast at all. ' +
+          '"Est. value we cannot see" prices the unvalued deals at each rep\'s own average ' +
+          'deal - it is the size of the blind spot, not a prediction.';
+    msgColor = '#b06000';
+  }
+  sh.getRange(r, 1).setValue(msg)
+    .setFontFamily(THEME.font).setFontSize(10).setFontWeight('bold').setFontColor(msgColor);
+  sh.setRowHeight(r, 32);
+  r += 2;
+
+  r = renderTable_(sh, r, 'Forecast coverage per rep', [
+    ['rep', 'Rep'],
+    ['open_opps', 'Open deals'],
+    ['with_value', 'Has value'],
+    ['with_close_date', 'Has close date'],
+    ['forecastable', 'Forecastable'],
+    ['forecastable_pct', 'Coverage %'],
+    ['known_value', 'Known value'],
+    ['avg_known_value', 'Avg deal (known)'],
+    ['unvalued_opps', 'Unvalued'],
+    ['est_blind_value', 'Est. blind value'],
+    ['overdue_opps', 'Overdue'],
+    ['stale_opps', 'Stale']
+  ], quality,
+    'Read "Coverage %" first. Everything to the right of it is only as trustworthy as that ' +
+    'number. A rep with no valued deals shows a blank average rather than zero, because ' +
+    'zero would read as "nothing missing".',
+    { freeze: true });
+
+  r = renderTable_(sh, r, 'Open deals', [
+    ['rep', 'Rep'],
+    ['company_name', 'Company'],
+    ['contact_name', 'Contact'],
+    ['opportunity_name', 'Opportunity'],
+    ['stage', 'Stage'],
+    ['deal_value', 'Deal value'],
+    ['expected_close_date', 'Expected close'],
+    ['days_to_close', 'Days to close'],
+    ['days_open', 'Days open'],
+    ['days_since_last_call', 'Days since call'],
+    ['calls', 'Calls'],
+    ['connects', 'Connects'],
+    ['prospect_id', 'ProspectId']
+  ], deals,
+    'Sorted by expected close date, deals with no date last. Amber = no deal value. ' +
+    'Red = past its close date or untouched for 14 days.',
+    { freeze: false });
+
+  // Flag the rows that need work, straight from the SQL booleans rather than from a
+  // spreadsheet formula reading the displayed cells. A formula would have to re-derive
+  // "stale" from a blank cell, and in Sheets a blank compares as 0 - so a deal that has
+  // never been called at all would read as 0 days since last call and escape the flag,
+  // which is the exact opposite of the truth.
+  //
+  // renderTable_ returns the next free row, so the first body row is (returned - n - 2).
+  var bodyStart = r - deals.length - 2;
+  for (var d2 = 0; d2 < deals.length; d2++) {
+    var row = deals[d2];
+    if (row.overdue || row.stale) {
+      sh.getRange(bodyStart + d2, 1, 1, 13).setBackground(THEME.bad);
+    } else if (row.missing_value || row.missing_close_date) {
+      sh.getRange(bodyStart + d2, 1, 1, 13).setBackground(THEME.warn);
+    }
+  }
+  sh.getRange(bodyStart, 6, deals.length, 1).setNumberFormat('"₹"#,##0');
+
+  sh.setColumnWidth(1, 150); sh.setColumnWidth(2, 210); sh.setColumnWidth(3, 150);
+  sh.setColumnWidth(4, 210);
+  return sh;
+}
+
+/**
+ * QC - every number on every tab, checked against something that does not share its
+ * arithmetic.
+ *
+ * This tab exists because a dashboard that is quietly wrong is worse than no dashboard. A
+ * FAIL here means a number elsewhere in the workbook cannot be trusted; the boundaries block
+ * underneath states what the data physically cannot know, so an empty column is never
+ * mistaken for a zero.
+ */
+function writeQc_() {
+  var checks, bounds;
+  try {
+    checks = sbSelect_('v_qc_pipeline', 'select=*&order=seq.asc', 100);
+    bounds = sbSelect_('v_data_boundaries', 'select=*', 100);
+  } catch (e) {
+    var shx = ensureSheet_(TABS.QC);
+    shx.clear();
+    shx.getRange(1, 1).setValue('QC').setFontFamily(THEME.font)
+      .setFontSize(THEME.titleSize).setFontWeight('bold');
+    shx.getRange(3, 1).setValue('Not available - run migration 010. ' + e)
+      .setFontFamily(THEME.font).setFontColor(THEME.muted);
+    return;
+  }
+
+  var sh = ensureSheet_(TABS.QC);
+  sh.clear();
+  clearBandings_(sh);
+  sh.setHiddenGridlines(true);
+
+  var fails = 0, warns = 0;
+  for (var i = 0; i < checks.length; i++) {
+    if (checks[i].status === 'FAIL') fails++;
+    else if (checks[i].status === 'WARN' || checks[i].status === 'STALE' ||
+             checks[i].status === 'GAP') warns++;
+  }
+
+  var r = renderKpis_(sh, 1, [
+    { label: 'Checks run', value: checks.length, format: '#,##0' },
+    { label: 'Failing', value: fails, format: '#,##0',
+      color: fails ? '#c5221f' : '#188038', bg: fails ? THEME.bad : THEME.good },
+    { label: 'Needs attention', value: warns, format: '#,##0',
+      color: warns ? '#b06000' : '#188038' }
+  ]);
+
+  r = renderTable_(sh, r, 'Data quality checks', [
+    ['check_name', 'Check'],
+    ['expected', 'Expected'],
+    ['actual', 'Actual'],
+    ['status', 'Status'],
+    ['scope', 'Checked against']
+  ], checks,
+    'FAIL means a number in this workbook is wrong. GAP and INFO are business gaps, not ' +
+    'pipeline bugs - they are things to fix in the CRM.',
+    { freeze: true });
+
+  var top = r - checks.length - 2;
+  for (var c = 0; c < checks.length; c++) {
+    var st = checks[c].status;
+    var bg = st === 'FAIL' ? THEME.bad
+           : (st === 'WARN' || st === 'STALE' || st === 'GAP') ? THEME.warn
+           : st === 'PASS' ? THEME.good : null;
+    if (bg) sh.getRange(top + c, 4).setBackground(bg).setFontWeight('bold');
+  }
+
+  renderTable_(sh, r, 'What the data can and cannot know', [
+    ['stream', 'Stream'],
+    ['row_count', 'Rows'],
+    ['earliest', 'Earliest'],
+    ['latest', 'Latest'],
+    ['note', 'Boundary']
+  ], bounds,
+    'Read this before quoting any historical number. A blank is not a zero - it is a period ' +
+    'the pipeline could not observe.',
+    { freeze: false });
+
+  sh.setColumnWidth(1, 300); sh.setColumnWidth(2, 110); sh.setColumnWidth(3, 110);
+  sh.setColumnWidth(4, 110); sh.setColumnWidth(5, 620);
+  return sh;
+}
+
+/**
+ * Put the tabs in a deliberate order and colour them by what they answer. Re-run on every
+ * refresh: new tabs otherwise land wherever Sheets puts them, and the strip drifts into the
+ * order things happened to be created in.
+ */
+function orderTabs_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var order = [TABS.DASHBOARD, TABS.REP_DAY, TABS.TREND, TABS.PIPELINE, TABS.REP_FUNNEL,
+               TABS.PROSPECTS, TABS.FUNNEL, TABS.DEALS, TABS.FORECAST, TABS.EXCEPTIONS,
+               TABS.QC, TABS.META, TABS.PENDING, TABS.UNPARSED];
+  for (var i = 0; i < order.length; i++) {
+    var sh = ss.getSheetByName(order[i]);
+    if (!sh) continue;
+    ss.setActiveSheet(sh);
+    ss.moveActiveSheet(i + 1);
+    if (TAB_COLOR[order[i]]) sh.setTabColor(TAB_COLOR[order[i]]);
+  }
+  var first = ss.getSheetByName(TABS.DASHBOARD);
+  if (first) ss.setActiveSheet(first);
+}
+
+function writeMeta_(failures) {
+  failures = failures || [];
   var h = sbSelect_('v_pipeline_health', 'select=*', 1)[0] || {};
   var pending = Math.max(0, ensureSheet_(TABS.PENDING).getLastRow() - 1);
   var unparsed = Math.max(0, ensureSheet_(TABS.UNPARSED).getLastRow() - 1);
@@ -910,7 +1401,9 @@ function writeMeta_() {
     ['Unrecognised payloads', unparsed],
     ['', ''],
     ['Disposition history', 'exact from 2026-08-08; "<no history>" before that is by design'],
-    ['Notes', 'NOT captured - this reports what happened, not why']
+    ['Notes', 'NOT captured - this reports what happened, not why'],
+    ['', ''],
+    ['Tabs that failed to refresh', failures.length ? failures.join('  |  ') : 'none']
   ];
   sh.getRange(1, 1, rows.length, 2).setValues(rows)
     .setFontFamily(THEME.font).setFontSize(THEME.size);
@@ -927,6 +1420,9 @@ function writeMeta_() {
   // stops being a signal.
   if (pending > 0) sh.getRange(13, 1, 1, 2).setBackground(THEME.warn).setFontWeight('bold');
   if (unparsed > 0) sh.getRange(14, 1, 1, 2).setBackground(THEME.warn).setFontWeight('bold');
+  if (failures.length) {
+    sh.getRange(rows.length, 1, 1, 2).setBackground(THEME.bad).setFontWeight('bold');
+  }
 
   sh.setColumnWidth(1, 300); sh.setColumnWidth(2, 620);
 }
@@ -1001,39 +1497,60 @@ function writeTable_(name, colDefs, rows, subtitle) {
   sh.clear();
   clearBandings_(sh);
   sh.setHiddenGridlines(true);
+  renderTable_(sh, 1, name, colDefs, rows, subtitle, { freeze: true });
+  autoWidth_(sh, colDefs, rows);
+  return sh;
+}
 
+/**
+ * Render one titled block at startRow WITHOUT clearing the sheet, and return the first free
+ * row after it. This is what lets a tab carry a summary above a detail table - the Forecast
+ * tab is unreadable as a bare 300-row list, and the number that matters (how much of the
+ * pipeline can be forecast at all) has to sit at the top where it is seen first.
+ *
+ * NO MERGED CELLS. Sheets refuses to freeze a boundary that cuts a merge, and a merged title
+ * spanning a block is exactly that boundary. Long titles simply overflow across the empty
+ * cells beside them, which looks identical and cannot conflict.
+ *
+ * opts: { freeze, banding, headerBg, totalRow }
+ *   totalRow - index into rows (0-based) to style as a totals line.
+ */
+function renderTable_(sh, startRow, title, colDefs, rows, subtitle, opts) {
+  opts = opts || {};
   var w = colDefs.length;
-  var titleRows = subtitle ? 2 : 1;
+  var r = startRow;
 
-  sh.getRange(1, 1, 1, w).merge().setValue(name)
-    .setFontFamily(THEME.font).setFontSize(THEME.titleSize).setFontWeight('bold')
-    .setVerticalAlignment('middle');
-  sh.setRowHeight(1, 30);
+  if (title) {
+    sh.getRange(r, 1).setValue(title)
+      .setFontFamily(THEME.font).setFontSize(THEME.titleSize).setFontWeight('bold')
+      .setFontColor(THEME.headerBg).setVerticalAlignment('middle');
+    sh.setRowHeight(r, 30);
+    r++;
+  }
   if (subtitle) {
-    sh.getRange(2, 1, 1, w).merge()
-      .setValue(subtitle + '   |   refreshed ' + istStamp_(new Date()) + ' IST')
+    sh.getRange(r, 1).setValue(subtitle)
       .setFontFamily(THEME.font).setFontSize(9).setFontStyle('italic')
       .setFontColor(THEME.subtitleFg).setWrap(false);
+    r++;
   }
 
-  var hRow = titleRows + 1;
+  var hRow = r;
   sh.getRange(hRow, 1, 1, w).setValues([colDefs.map(function (c) { return c[1]; })])
     .setFontFamily(THEME.font).setFontSize(THEME.size).setFontWeight('bold')
-    .setBackground(THEME.headerBg).setFontColor(THEME.headerFg)
+    .setBackground(opts.headerBg || THEME.headerBg).setFontColor(THEME.headerFg)
     .setVerticalAlignment('middle').setWrap(true);
   sh.setRowHeight(hRow, 34);
 
   if (!rows.length) {
     sh.getRange(hRow + 1, 1).setValue('No rows as at ' + istStamp_(new Date()) + ' IST')
       .setFontFamily(THEME.font).setFontColor(THEME.muted).setFontStyle('italic');
-    sh.setFrozenRows(hRow);
-    autoWidth_(sh, colDefs, rows);
-    return sh;
+    if (opts.freeze) sh.setFrozenRows(hRow);
+    return hRow + 3;
   }
 
-  var body = rows.map(function (r) {
+  var body = rows.map(function (row) {
     return colDefs.map(function (c) {
-      var v = r[c[0]];
+      var v = row[c[0]];
       return (v === null || v === undefined) ? '' : v;
     });
   });
@@ -1041,7 +1558,6 @@ function writeTable_(name, colDefs, rows, subtitle) {
   sh.getRange(bRow, 1, body.length, w).setValues(body)
     .setFontFamily(THEME.font).setFontSize(THEME.size).setWrap(false);
 
-  // Per-column number format and alignment.
   for (var c = 0; c < w; c++) {
     var t = colType_(colDefs[c][0], rows);
     var rng = sh.getRange(bRow, c + 1, body.length, 1);
@@ -1050,14 +1566,44 @@ function writeTable_(name, colDefs, rows, subtitle) {
     sh.getRange(hRow, c + 1).setHorizontalAlignment(ALIGN[t] === 'left' ? 'left' : 'center');
   }
 
-  sh.getRange(bRow, 1, body.length, w)
-    .applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, false, false);
+  if (opts.banding !== false) {
+    sh.getRange(bRow, 1, body.length, w)
+      .applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, false, false);
+  }
   sh.getRange(hRow, 1, body.length + 1, w)
     .setBorder(true, true, true, true, true, true, THEME.border, SpreadsheetApp.BorderStyle.SOLID);
 
-  sh.setFrozenRows(hRow);
-  autoWidth_(sh, colDefs, rows);
-  return sh;
+  if (opts.totalRow !== undefined && opts.totalRow !== null) {
+    sh.getRange(bRow + opts.totalRow, 1, 1, w)
+      .setBackground(THEME.totalBg).setFontWeight('bold');
+  }
+
+  if (opts.freeze) sh.setFrozenRows(hRow);
+  return bRow + body.length + 2;
+}
+
+/**
+ * A row of headline figures above a table. Label on top in small grey, value below, large.
+ *
+ * Written cell by cell rather than as a block because each tile is two rows of one column
+ * with different formatting, and the alternative - a merged 2x1 per tile - reintroduces the
+ * merge/freeze conflict this file already hit once.
+ */
+function renderKpis_(sh, startRow, tiles) {
+  for (var i = 0; i < tiles.length; i++) {
+    var col = i + 1;
+    sh.getRange(startRow, col).setValue(tiles[i].label)
+      .setFontFamily(THEME.font).setFontSize(9).setFontColor(THEME.subtitleFg)
+      .setHorizontalAlignment('left');
+    var cell = sh.getRange(startRow + 1, col).setValue(tiles[i].value)
+      .setFontFamily(THEME.font).setFontSize(16).setFontWeight('bold')
+      .setHorizontalAlignment('left');
+    if (tiles[i].format) cell.setNumberFormat(tiles[i].format);
+    if (tiles[i].color) cell.setFontColor(tiles[i].color);
+    if (tiles[i].bg) sh.getRange(startRow, col, 2, 1).setBackground(tiles[i].bg);
+  }
+  sh.setRowHeight(startRow + 1, 26);
+  return startRow + 3;
 }
 
 /**

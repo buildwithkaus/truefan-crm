@@ -139,17 +139,29 @@ Callkaro-only (52%)**, 7,675 to pull, two nights at a 4,000-call ceiling.
 
 ## 5. Sheet tabs
 
+Tabs are ordered and colour-coded on every refresh by `orderTabs_()`: blue = calling
+activity, green = the book and the funnel, red = things to fix, amber = QC, grey = plumbing.
+
 | Tab | Contents |
 |---|---|
 | **Dashboard** | KPI strip + the pivot: rows rep × stage-at-call, columns disposition, cells calls |
 | **Rep Day** | Per rep per day, 7 days |
 | **Daily Trend** | Whole-team totals by day — the month view |
-| **Funnel** | Stage movement; calls measure effort, this measures progress |
+| **Pipeline State** | What each rep *holds*, from the daily book snapshot |
+| **Rep Funnel** | Book → Engaged → Prospect → Opportunity → Won/Lost, one row per rep |
+| **Prospects Daily** | Matrix: days down, reps across. The production number |
+| **Stage Movement** | Every stage transition; calls measure effort, this measures progress |
+| **Deal Board** | Per-rep deal book, plus open deals by stage |
+| **Forecast** | Every open deal — value, close date, staleness — and how much of it is forecastable |
 | **Exceptions** | The hygiene worklist, one row per violation |
-| **Prospects** | Contacts promoted to Prospect |
+| **QC** | Every check, expected vs actual, plus what the data cannot know |
 | **Meta** | Health. Turns red when nothing has ingested recently |
 | **Pending** | Rows parked because Supabase was unreachable; retried every 5 min |
 | **Unparsed** | Payload shapes the parser did not recognise |
+
+`refreshReports()` wraps each tab individually. One failing view — a migration not yet run, a
+renamed column — cannot take the whole refresh down and silently leave every other tab stale;
+the failure is listed on **Meta** under "Tabs that failed to refresh".
 
 `Pending` and `Unparsed` must normally be empty. `Unparsed` earned its keep on day one — it
 captured 281 field-change payloads whose shape was unknown, which is how §3 got built.
@@ -169,6 +181,76 @@ are exactly the values reps cannot filter on in LSQ.
 | `CONNECTED_NO_DISPOSITION` | 2 | Connected, disposition blank |
 | `NO_STAGE_UPDATE_AFTER_CALL` | 2 | No stage change at or after the last call |
 | `NON_CANONICAL_VALUE` | 2 | Stored value is not a selectable dropdown option |
+
+### The opportunity funnel
+
+The contact journey is **Fresh → Engaged → Prospect → (opportunity) → Won | Lost**, with
+**Disqualified** available as an exit at any point. Reaching `Prospect` is what creates an
+opportunity, and an opportunity carries a status of `Open`, `Won` or `Lost` plus a finer deal
+stage.
+
+Opportunities attach to a **Lead, not a Company**, and only the contact flagged
+`IsPrimaryContact` may own one. A Prospect-stage contact with no opportunity is therefore
+either a genuine CRM gap or a non-primary contact at an account that already has a deal —
+`Rep Funnel`'s *Prospect > Opp %* column is where that shows up.
+
+**Prospects created is counted from stage transitions, not from current stage.** A contact
+promoted on Tuesday and disqualified on Thursday still counts for Tuesday; reading current
+stage instead would delete a rep's work retroactively every time a deal went bad. Re-entries
+(a contact that had already been a Prospect) are counted but broken out separately — they are
+recovered pipeline, not new pipeline.
+
+**Attribution is actor-first**, unlike call attribution. A rep promotes their own contacts, so
+actor and owner are normally the same person; they diverge only on admin edits, bulk
+operations and integration writes, which is precisely the activity that should not land in a
+rep's production count. Those appear as their own column instead.
+
+### The forecast, and why it is empty
+
+`Forecast` lists every open deal with its value, expected close date, days open and days since
+last call. The headline of the tab is not a forecast — it is *forecast coverage*, the share of
+open deals carrying both fields.
+
+**Today that share is zero, and not because reps have not filled the fields in.** Enumerated
+live on 2026-08-09 across 23 real opportunities: the Opportunity object has 66 properties and
+**four** custom fields — `mx_Custom_1` (deal name), `mx_Custom_2` (deal stage), and
+`mx_Custom_6` / `mx_Custom_8`, both empty on every deal and carrying no display name.
+
+> **There is no deal-value field and no expected-closure-date field. Absent, not blank.**
+
+Nobody can fill in a field that has not been created, so this is a five-minute admin task on
+the LSQ Opportunity object, not a coaching problem. The tab says exactly that, in those terms,
+rather than showing a sea of blanks that reads like rep negligence. The warehouse columns and
+every forecast view are already written against them — creating the fields makes this work with
+no further code change.
+
+Once values do exist, `Est. value we cannot see` prices the unvalued deals at each rep's own
+average deal size. It is **the size of the blind spot, not a prediction**, and is labelled that
+way wherever it appears. Where a rep has no valued deals at all it stays blank rather than
+showing zero — zero would read as "nothing missing".
+
+### Deal stages
+
+Enumerated live, not hardcoded: `Prospect` 117 · `Requirement Gathering` 15 · `In Discussion` 4,
+all at status `Open`. `Requirement Gathering` is a **legacy value** that
+`scripts/lib/schema.ps1` (`OpportunityStageRenames`) specifies should have become `Prospect`;
+that rename is a dropdown edit in the UI and was never applied. Same failure mode as the
+contact-stage drift found the day before — a migration recorded as complete with live records
+still on the old value. `v_deal_stage_drift` and QC check 10 watch it.
+
+The rest of the tab works before a single amount is entered: `overdue`, `stale` (14 days with
+no call) and `days open` need no deal value, so it is a deal-hygiene worklist from day one.
+
+### Coming: per-call disposition, recording, transcript
+
+Three changes are in flight and all three land on `fact_call`, whose columns already exist
+(`disposition`, `recording_url`, `transcript`, `transcript_url`), nullable and unused. Adding
+a nullable column to an 8,000-row table is instant; retrofitting after 200,000 rows, with a
+re-ingest costing one API call per lead because there is no bulk activity read, is not.
+
+`v_call_disposition_at_time` already prefers `fact_call.disposition` and falls back to the
+12-hour inference from the contact-level field. The day LSQ ships per-call dispositions this
+needs a mapping line in the ingest, not a redesign, and history stays continuous.
 
 ### Attribution rules (non-negotiable)
 
@@ -198,8 +280,33 @@ match what the LSQ UI filter shows. A rep calls a lead at 10:00 and Callkaro tou
 15:00, and that lead drops out of scope — so its total is a **floor, not the truth**. It
 reported 418 for a day the pipeline recorded 980+, and the pipeline was right.
 
-Standing checks: `Meta` not red · `Pending` and `Unparsed` empty · `-Action List` shows no
-webhook `DISABLED - 10 consecutive failures`.
+### The QC tab
+
+`v_qc_pipeline` runs ten checks inside the warehouse, each against something that does not
+share its arithmetic, and the **QC** tab renders them with expected vs actual.
+
+| # | Check | Why it exists |
+|---|---|---|
+| 1 | No duplicate call activity ids | The PK makes it impossible; cheap proof the PK is what we think |
+| 2 | Every call joins to an enriched contact | An unenriched call has no rep, company or stage, so it vanishes from every grouped view — **the most common cause of a total lower than LSQ's own filter** |
+| 3 | `connected` matches `duration > 0` | Derived field must not drift from its source |
+| 4 | No Callkaro AI-dialler calls stored | 208 inflates every coverage number and looks like rep activity |
+| 5 | Pivot total equals raw dials today | Two different SQL paths to the same number; divergence means the pivot is dropping rows |
+| 6 | Prospect-stage contacts that have an opportunity | A CRM gap, not a pipeline bug |
+| 7 | Every opportunity joins to a contact | Otherwise the deal board shows `<unassigned>` for a real rep |
+| 8 | Contacts on a non-canonical stage | Drifted values are invisible to a rep's own LSQ filter |
+| 9 | Open opportunities that can be forecast | The business number this exists to expose |
+| 10 | Book snapshot is from today | A stale snapshot looks exactly like a current one |
+
+`FAIL` means a number in the workbook is wrong. `GAP`, `INFO` and `STALE` are business gaps or
+operational reminders, not pipeline bugs.
+
+The **"What the data can and cannot know"** block underneath (`v_data_boundaries`) states the
+earliest and latest observation per stream. Read it before quoting any historical number — a
+blank is not a zero, it is a period the pipeline could not observe.
+
+Standing checks: `Meta` not red · `Pending` and `Unparsed` empty · QC shows zero `FAIL` ·
+`-Action List` shows no webhook `DISABLED - 10 consecutive failures`.
 
 ---
 
