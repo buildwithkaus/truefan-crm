@@ -171,5 +171,43 @@ for ($i = 0; $i -lt $all.Count; $i += 500) {
 
 Write-LsqLog "" $logPath
 Write-LsqLog "Wrote $written rows for $SnapshotDate." $logPath
+
+# ---------------------------------------------------------------------------------------
+# Keep dim_rep current, from the same scan.
+#
+# dim_rep is the owner_id -> name map every report joins through, and it sat EMPTY from
+# migration 001 until 2026-08-09 because nothing ever populated it. The symptom was subtle:
+# most views coalesce through dim_contact and looked fine, but anywhere that fallback did not
+# apply - stage changes made by someone holding no contacts, for one - a raw GUID appeared on
+# a rep-facing tab as though it were a person.
+#
+# This scan already sees every owner in the account, so it is the natural place to maintain
+# it. Cheap: no extra API calls, one upsert.
+# ---------------------------------------------------------------------------------------
+$repRows = New-Object System.Collections.Generic.List[object]
+$seenRep = @{}
+foreach ($k in $tally.Keys) {
+    $parts = $k.Split('|')
+    $oid = $parts[0]; $nm = $parts[1]
+    if (-not $oid -or -not $nm -or $seenRep.ContainsKey($oid)) { continue }
+    $seenRep[$oid] = $true
+    [void]$repRows.Add([ordered]@{
+        owner_id     = $oid
+        lsq_name     = $nm
+        is_active    = $true
+        last_seen_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    })
+}
+if ($repRows.Count -gt 0) {
+    $rj = ConvertTo-Json -InputObject $repRows.ToArray() -Depth 4
+    if ($repRows.Count -eq 1) { $rj = "[$rj]" }
+    [void](Invoke-LsqWithRetry -What "upsert dim_rep" -Action {
+        Invoke-RestMethod -Uri "$sbUrl/rest/v1/dim_rep" -Method Post `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes($rj)) -Headers $headers `
+            -ContentType "application/json; charset=utf-8" -ErrorAction Stop
+    })
+    Write-LsqLog "Refreshed dim_rep: $($repRows.Count) owners." $logPath
+}
+
 Write-LsqLog "Verify independently rather than trusting this line:" $logPath
 Write-LsqLog "  GET /rest/v1/v_pipeline_state_wide?select=*" $logPath
