@@ -65,6 +65,11 @@ var TAB_COLOR = {
   'Meta': '#80868b', 'Pending': '#80868b', 'Unparsed': '#80868b'
 };
 
+// Bumped on every code change. diagnose() and the Meta tab both print it, which is the only
+// reliable way to tell "my paste did not take effect" apart from "the code ran and did
+// nothing" - two failures that look identical from the Sheet.
+var CODE_VERSION = '2026-08-09.4-bundle-teams';
+
 var IST_OFFSET_MS = 330 * 60 * 1000;
 
 // Every daily series starts here. This is the first date the backfill covers, so anything
@@ -140,6 +145,9 @@ function cfg_(key, optional) {
  * and LeadSquared reachability - and it writes nothing anywhere.
  */
 function diagnose() {
+  Logger.log('CODE_VERSION = ' + CODE_VERSION);
+  Logger.log('If that is not the version you just pasted, the paste did not save - everything ' +
+             'below describes the OLD code.');
   var props = PropertiesService.getScriptProperties();
   var keys = props.getKeys();
   Logger.log('Script Properties set: [' + keys.join(', ') + ']');
@@ -197,6 +205,31 @@ function diagnose() {
     }
   } catch (e) { Logger.log('LSQ probe failed: ' + e); }
 
+  // The bundle is what every tab now renders from, so if it fails, everything is stale and
+  // no individual tab will tell you why. Checked here explicitly.
+  try {
+    var B = sbBundle_(HISTORY_FROM);
+    var names = [];
+    for (var kk in B) {
+      if (B[kk] && B[kk].length !== undefined) names.push(kk + '=' + B[kk].length);
+    }
+    Logger.log('report_bundle OK: ' + names.join(' '));
+    if (!B.rep_funnel || !B.rep_funnel.length) {
+      Logger.log('*** rep_funnel is EMPTY - the Teams and Rep Funnel tabs will render blank. ' +
+                 'Run scripts/pipeline/03-snapshot-book.ps1; the funnel is built on the book ' +
+                 'snapshot. ***');
+    }
+    if (!B.team_summary || !B.team_summary.length) {
+      Logger.log('*** team_summary is EMPTY - migration 013 may not be applied. ***');
+    }
+  } catch (e) {
+    Logger.log('*** report_bundle FAILED: ' + e);
+    Logger.log('    If this says "Service invoked too many times", it is the UrlFetch quota ' +
+               '(20,000/day, shared across EVERY trigger) - not a code fault. It resets on a ' +
+               'rolling daily basis; nothing will refresh until it does.');
+    return;
+  }
+
   // Triggers are the thing most often forgotten after a re-paste: setUp() must be re-run,
   // and without it nothing enriches and no tab ever refreshes.
   var trig = ScriptApp.getProjectTriggers().map(function (t) { return t.getHandlerFunction(); });
@@ -204,6 +237,17 @@ function diagnose() {
   if (trig.indexOf('enrichLeads') < 0) {
     Logger.log('*** enrichLeads is NOT scheduled - run setUp(). Until it runs, every rep ' +
                'shows as <unenriched> and no contact stage is known. ***');
+  }
+
+  // Has a refresh actually happened since the code changed? Deploying does not run anything,
+  // and a tab that exists but is blank is almost always setUp() having created it while
+  // refreshReports has not yet succeeded.
+  var meta = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(TABS.META);
+  if (meta && meta.getLastRow() >= 3) {
+    Logger.log('Meta says last refreshed: ' + meta.getRange(3, 2).getValue());
+  } else {
+    Logger.log('*** Meta has never been written - refreshReports() has not completed. ' +
+               'Run it by hand from the editor; deploying alone does not run it. ***');
   }
 
   Logger.log('--- diagnose complete ---');
@@ -1660,6 +1704,7 @@ function writeMeta_(failures, B, fetches) {
     ['Pipeline health', ''],
     ['', ''],
     ['Reports refreshed', istStamp_(new Date()) + ' IST'],
+    ['Code version', CODE_VERSION],
     ['Minutes since last call ingested', isNaN(mins) ? 'never' : mins],
     ['STATUS', stale ? 'STALE - nothing ingested recently. Check the webhooks are still enabled.' : 'Live'],
     ['', ''],
@@ -1685,21 +1730,33 @@ function writeMeta_(failures, B, fetches) {
   sh.getRange(1, 1, rows.length, 2).setValues(rows)
     .setFontFamily(THEME.font).setFontSize(THEME.size);
 
+  // Rows are located BY LABEL, never by a hardcoded index. Inserting one line above shifts
+  // every constant below it, and the failure is silent - the wrong row gets the STATUS
+  // colour and nobody notices. Same class of bug as the deal-value column index.
+  function rowOf(label) {
+    for (var i = 0; i < rows.length; i++) if (rows[i][0] === label) return i + 1;
+    return 0;
+  }
+  function tint(label, colour) {
+    var rr = rowOf(label);
+    if (rr) sh.getRange(rr, 1, 1, 2).setBackground(colour).setFontWeight('bold');
+  }
+
   sh.getRange(1, 1, 1, 2).merge().setFontWeight('bold').setFontSize(THEME.titleSize);
   sh.setRowHeight(1, 32);
-  sh.getRange(5, 1, 1, 2).setFontWeight('bold')
-    .setBackground(stale ? THEME.bad : THEME.good)
+  tint('STATUS', stale ? THEME.bad : THEME.good);
+  sh.getRange(rowOf('STATUS'), 1, 1, 2)
     .setBorder(true, true, true, true, false, false, THEME.border, SpreadsheetApp.BorderStyle.SOLID);
   sh.getRange(3, 1, rows.length - 2, 1).setFontColor(THEME.subtitleFg);
-  sh.getRange(7, 2, 5, 1).setNumberFormat('#,##0').setHorizontalAlignment('left');
+
+  var firstNum = rowOf('Calls today (IST)');
+  if (firstNum) sh.getRange(firstNum, 2, 5, 1).setNumberFormat('#,##0').setHorizontalAlignment('left');
 
   // Amber only when there is genuinely something to look at - a permanently coloured row
   // stops being a signal.
-  if (pending > 0) sh.getRange(13, 1, 1, 2).setBackground(THEME.warn).setFontWeight('bold');
-  if (unparsed > 0) sh.getRange(14, 1, 1, 2).setBackground(THEME.warn).setFontWeight('bold');
-  if (failures.length) {
-    sh.getRange(rows.length, 1, 1, 2).setBackground(THEME.bad).setFontWeight('bold');
-  }
+  if (pending > 0) tint('Rows parked (Supabase unreachable)', THEME.warn);
+  if (unparsed > 0) tint('Unrecognised payloads', THEME.warn);
+  if (failures.length) tint('Tabs that failed to refresh', THEME.bad);
 
   sh.setColumnWidth(1, 300); sh.setColumnWidth(2, 620);
 }
