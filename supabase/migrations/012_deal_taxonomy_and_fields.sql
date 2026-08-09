@@ -131,6 +131,12 @@ group by 1, 2;
 -- Column list changes, so it must be dropped rather than replaced, and everything reading
 -- it goes with it.
 -- --------------------------------------------------------------------------------------
+-- Order matters and is not obvious: v_qc_pipeline (010) reads v_forecast_quality and
+-- v_opportunity_primary, so it has to go FIRST or the drop below fails with
+-- "cannot drop view v_forecast_quality because other objects depend on it". It is rebuilt at
+-- the end of this file. Deliberately not CASCADE - cascade would silently take out whatever
+-- else happened to depend on these, and the point of listing them is to know.
+drop view if exists v_qc_pipeline;
 drop view if exists v_funnel_conversion;
 drop view if exists v_funnel_rep;
 drop view if exists v_journey;
@@ -457,7 +463,149 @@ where ct.contact_stage in ('Requirement Gathering','Requirement Gathering (Warm)
                            'Follow Up','Fresh Lead','Future Prospect');
 
 
+-- --------------------------------------------------------------------------------------
+-- v_qc_pipeline - rebuilt, because it had to be dropped above to release
+-- v_forecast_quality. Same 13 checks as 010 with three corrected:
+--
+--   10  Requirement Gathering is now canonical, so a healthy warm pipeline stops failing.
+--   11  the deal-value field EXISTS - the old 'NO FIELD' verdict was based on a wrong
+--       finding. An empty column here is a process gap, not a missing field.
+--   14  new: the hygiene backlog, surfaced as a number rather than left to be rediscovered.
+-- --------------------------------------------------------------------------------------
+create view v_qc_pipeline as
+
+select 1 as seq, 'No duplicate call activity ids' as check_name,
+       '0'::text as expected,
+       (count(*) - count(distinct activity_id))::text as actual,
+       case when count(*) = count(distinct activity_id) then 'PASS' else 'FAIL' end as status,
+       'fact_call'::text as scope
+from fact_call
+
+union all
+select 2, 'Every call joins to an enriched contact', '0', count(*)::text,
+       case when count(*) = 0 then 'PASS' else 'WARN' end,
+       'fact_call left join dim_contact'
+from fact_call c
+left join dim_contact ct on ct.prospect_id = c.prospect_id
+where ct.prospect_id is null
+
+union all
+select 3, 'connected flag matches duration > 0', '0', count(*)::text,
+       case when count(*) = 0 then 'PASS' else 'FAIL' end, 'fact_call'
+from fact_call where connected <> (duration_sec > 0)
+
+union all
+select 4, 'No Callkaro AI-dialler calls stored', '0', count(*)::text,
+       case when count(*) = 0 then 'PASS' else 'FAIL' end,
+       'fact_call.event_code in (21,22) only'
+from fact_call where event_code not in ('21','22')
+
+union all
+select 5, 'Pivot total equals raw dials (today)',
+       (select count(*)::text from fact_call
+         where call_date_ist = ((now() at time zone 'UTC') + interval '5 hours 30 minutes')::date
+           and direction = 'outbound'),
+       coalesce((select sum(calls)::text from v_pivot_disposition
+                  where call_date_ist = ((now() at time zone 'UTC') + interval '5 hours 30 minutes')::date), '0'),
+       case when (select count(*) from fact_call
+                   where call_date_ist = ((now() at time zone 'UTC') + interval '5 hours 30 minutes')::date
+                     and direction = 'outbound')
+               = coalesce((select sum(calls) from v_pivot_disposition
+                            where call_date_ist = ((now() at time zone 'UTC') + interval '5 hours 30 minutes')::date), 0)
+            then 'PASS' else 'FAIL' end,
+       'v_pivot_disposition vs fact_call'
+
+union all
+select 6, 'Prospect-stage contacts that have a deal',
+       (select count(*)::text from dim_contact where contact_stage = 'Prospect'),
+       (select count(distinct o.prospect_id)::text
+          from v_opportunity_primary o
+          join dim_contact ct on ct.prospect_id = o.prospect_id
+         where ct.contact_stage = 'Prospect'),
+       'INFO', 'dim_contact vs fact_opportunity'
+
+union all
+select 7, 'Every opportunity joins to a contact', '0', count(*)::text,
+       case when count(*) = 0 then 'PASS' else 'WARN' end,
+       'fact_opportunity left join dim_contact'
+from fact_opportunity o
+left join dim_contact ct on ct.prospect_id = o.prospect_id
+where ct.prospect_id is null
+
+union all
+select 8, 'Contacts on a non-canonical stage', '0',
+       coalesce((select sum(contacts)::text from v_stage_drift), '0'),
+       case when coalesce((select sum(contacts) from v_stage_drift), 0) = 0 then 'PASS' else 'FAIL' end,
+       'fact_book_snapshot vs canonical stage list'
+
+union all
+select 9, 'Open opportunities that can be forecast',
+       (select coalesce(sum(open_opps), 0)::text from v_forecast_quality),
+       (select coalesce(sum(forecastable), 0)::text from v_forecast_quality),
+       case when (select coalesce(sum(open_opps), 0) from v_forecast_quality) = 0 then 'INFO'
+            when (select coalesce(sum(forecastable), 0) from v_forecast_quality)
+               = (select coalesce(sum(open_opps), 0) from v_forecast_quality) then 'PASS'
+            else 'GAP' end,
+       'v_forecast_quality'
+
+union all
+-- Requirement Gathering is canonical as of 012, so this should now read 0. If it does not,
+-- somebody has invented a genuinely new deal stage.
+select 10, 'Deals on a non-canonical stage', '0',
+       coalesce((select sum(opportunities)::text from v_deal_stage_drift), '0'),
+       case when coalesce((select sum(opportunities) from v_deal_stage_drift), 0) = 0
+            then 'PASS' else 'FAIL' end,
+       'fact_opportunity vs canonical deal stage list'
+
+union all
+-- The field exists (mx_Custom_6, Expected Deal Size). Empty is a process gap, not an
+-- absent field - the earlier 'NO FIELD' verdict came from a misreading of the API payload.
+select 11, 'Open deals carrying an Expected Deal Size',
+       (select coalesce(sum(open_opps), 0)::text from v_forecast_quality),
+       (select coalesce(sum(with_value), 0)::text from v_forecast_quality),
+       case when (select coalesce(sum(open_opps), 0) from v_forecast_quality) = 0 then 'INFO'
+            when (select coalesce(sum(with_value), 0) from v_forecast_quality)
+               = (select coalesce(sum(open_opps), 0) from v_forecast_quality) then 'PASS'
+            else 'GAP' end,
+       'mx_Custom_6 - the field exists; this measures adoption'
+
+union all
+select 12, 'Unbounded streams are not clipped to the call window',
+       'earliest opportunity and stage change both older than earliest call',
+       coalesce((select 'opp ' || min(created_date_ist)::text from fact_opportunity), 'opp none')
+         || ' / stage ' ||
+       coalesce((select min(changed_at_utc)::date::text from fact_stage_change), 'none')
+         || ' / call ' ||
+       coalesce((select min(call_date_ist)::text from fact_call), 'none'),
+       case
+         when (select count(*) from fact_opportunity) = 0 then 'INFO'
+         when (select min(created_date_ist) from fact_opportunity)
+              >= (select min(call_date_ist) from fact_call)
+           or (select min(changed_at_utc)::date from fact_stage_change)
+              >= (select min(call_date_ist) from fact_call)
+         then 'FAIL' else 'PASS' end,
+       'fact_opportunity / fact_stage_change vs fact_call'
+
+union all
+select 13, 'Book snapshot is from today',
+       ((now() at time zone 'UTC') + interval '5 hours 30 minutes')::date::text,
+       coalesce((select max(snapshot_date)::text from fact_book_snapshot), 'never'),
+       case when (select max(snapshot_date) from fact_book_snapshot)
+               = ((now() at time zone 'UTC') + interval '5 hours 30 minutes')::date
+            then 'PASS' else 'STALE' end,
+       'fact_book_snapshot'
+
+union all
+-- The remediation backlog as a single number. Not a pipeline defect - CRM state that needs
+-- clearing, and it belongs where someone will see it rather than in a one-off query.
+select 14, 'Opportunity hygiene items outstanding', '0',
+       coalesce((select count(*)::text from v_opportunity_hygiene), '0'),
+       case when coalesce((select count(*) from v_opportunity_hygiene), 0) = 0
+            then 'PASS' else 'GAP' end,
+       'v_opportunity_hygiene - see the breakdown by issue';
+
+
 grant select on v_opportunity_primary, v_deal_stage_detail, v_deal_board, v_forecast,
                 v_forecast_quality, v_journey, v_funnel_rep, v_funnel_conversion,
-                v_deal_stage_drift, v_opportunity_hygiene
+                v_deal_stage_drift, v_opportunity_hygiene, v_qc_pipeline
           to anon, authenticated;
