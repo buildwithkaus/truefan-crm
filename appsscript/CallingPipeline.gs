@@ -68,7 +68,7 @@ var TAB_COLOR = {
 // Bumped on every code change. diagnose() and the Meta tab both print it, which is the only
 // reliable way to tell "my paste did not take effect" apart from "the code ran and did
 // nothing" - two failures that look identical from the Sheet.
-var CODE_VERSION = '2026-08-09.4-bundle-teams';
+var CODE_VERSION = '2026-08-09.5-budget-guard';
 
 var IST_OFFSET_MS = 330 * 60 * 1000;
 
@@ -126,6 +126,47 @@ function ensureSheet_(name, header) {
   return sh;
 }
 
+// =======================================================================================
+// URLFETCH BUDGET
+//
+// On 2026-08-09 the whole workbook stopped with "Service invoked too many times for one day:
+// premium urlfetch" and stayed broken for the rest of the day. The cause was enrichLeads
+// spending roughly 29,000 calls a day on its own; the effect was that the LAST tabs to render
+// simply vanished, which reads like a code fault and is not one.
+//
+// The spend is now bounded by construction, but bounded-by-construction is what the previous
+// version also believed about itself. So: count the calls, keep a running daily total, and
+// let the cheap job (reporting) survive a runaway in the expensive one (enrichment).
+//
+// The counter is kept in memory during an execution and flushed ONCE at the end - a
+// PropertiesService read/write per fetch would just move the quota problem to a different
+// quota.
+// =======================================================================================
+
+var UF_CALLS = 0;                  // this execution
+var UF_ENRICH_CEILING = 8000;      // enrichment stops here; reporting keeps working
+
+function ufFetch_(url, params) {
+  UF_CALLS++;
+  return UrlFetchApp.fetch(url, params);
+}
+
+function ufKey_() { return 'UF_SPEND_' + istToday_(); }
+
+/** Today's total so far, from previous executions. One property read. */
+function ufSpentToday_() {
+  return Number(PropertiesService.getScriptProperties().getProperty(ufKey_()) || 0);
+}
+
+/** Add this execution's calls to today's total. One read, one write, at the very end. */
+function ufFlush_() {
+  if (!UF_CALLS) return;
+  var props = PropertiesService.getScriptProperties();
+  var key = ufKey_();
+  props.setProperty(key, String(Number(props.getProperty(key) || 0) + UF_CALLS));
+  UF_CALLS = 0;
+}
+
 function cfg_(key, optional) {
   var v = PropertiesService.getScriptProperties().getProperty(key);
   if (!v && !optional) {
@@ -148,6 +189,8 @@ function diagnose() {
   Logger.log('CODE_VERSION = ' + CODE_VERSION);
   Logger.log('If that is not the version you just pasted, the paste did not save - everything ' +
              'below describes the OLD code.');
+  Logger.log('UrlFetch spent today (this script\'s own count): ' + ufSpentToday_() +
+             '. Enrichment yields above ' + UF_ENRICH_CEILING + '.');
   var props = PropertiesService.getScriptProperties();
   var keys = props.getKeys();
   Logger.log('Script Properties set: [' + keys.join(', ') + ']');
@@ -186,7 +229,7 @@ function diagnose() {
       ingest_source: 'webhook'
     }]);
     Logger.log('Supabase WRITE ok');
-    UrlFetchApp.fetch(cfg_('SUPABASE_URL').replace(/\/+$/, '') +
+    ufFetch_(cfg_('SUPABASE_URL').replace(/\/+$/, '') +
       '/rest/v1/fact_call?activity_id=eq.00000000-0000-0000-0000-00000000diag', {
       method: 'delete',
       headers: { apikey: cfg_('SUPABASE_SERVICE_KEY'), Authorization: 'Bearer ' + cfg_('SUPABASE_SERVICE_KEY') },
@@ -251,6 +294,7 @@ function diagnose() {
   }
 
   Logger.log('--- diagnose complete ---');
+  ufFlush_();
 }
 
 
@@ -261,7 +305,7 @@ function diagnose() {
 /** Upsert rows into a table, keyed on its primary key. Idempotent by construction. */
 function sbUpsert_(table, rows) {
   if (!rows || rows.length === 0) return 0;
-  var res = UrlFetchApp.fetch(cfg_('SUPABASE_URL').replace(/\/+$/, '') + '/rest/v1/' + table, {
+  var res = ufFetch_(cfg_('SUPABASE_URL').replace(/\/+$/, '') + '/rest/v1/' + table, {
     method: 'post',
     contentType: 'application/json',
     headers: {
@@ -292,7 +336,7 @@ function sbUpsert_(table, rows) {
  */
 function sbBundle_(fromDate) {
   var url = cfg_('SUPABASE_URL').replace(/\/+$/, '') + '/rest/v1/rpc/report_bundle';
-  var res = UrlFetchApp.fetch(url, {
+  var res = ufFetch_(url, {
     method: 'post',
     contentType: 'application/json',
     headers: {
@@ -313,7 +357,7 @@ function sbBundle_(fromDate) {
 function sbSelect_(view, query, limit) {
   var url = cfg_('SUPABASE_URL').replace(/\/+$/, '') + '/rest/v1/' + view +
             (query ? ('?' + query) : '');
-  var res = UrlFetchApp.fetch(url, {
+  var res = ufFetch_(url, {
     method: 'get',
     headers: {
       apikey: cfg_('SUPABASE_SERVICE_KEY'),
@@ -408,6 +452,10 @@ function handle_(e) {
       ]);
     } catch (e2) { /* nothing further to do */ }
     return ok_('handler error: ' + err);
+  } finally {
+    // The webhook path is the highest-frequency caller in the system - every batch LSQ sends
+    // is one execution. Its spend has to be counted or the daily total is fiction.
+    try { ufFlush_(); } catch (e3) { /* never let accounting break the 200 */ }
   }
 }
 
@@ -489,6 +537,8 @@ function flushPending() {
     Logger.log('flushPending: wrote ' + (calls.length + outcomes.length) + ' parked rows');
   } catch (err) {
     Logger.log('flushPending: still failing - ' + err);
+  } finally {
+    ufFlush_();
   }
 }
 
@@ -573,6 +623,17 @@ function normalizeWebhookActivity_(item) {
 function enrichLeads(maxLeads) {
   maxLeads = maxLeads || 120;
 
+  // Enrichment yields to reporting. It is the job that ran away and killed the workbook, and
+  // it is also the one whose work can wait an hour - a rep name arriving late is a cosmetic
+  // problem, a dashboard that stops refreshing is not. If today's spend is already high,
+  // stop here so the reports keep their allowance.
+  var spent = ufSpentToday_();
+  if (spent >= UF_ENRICH_CEILING) {
+    Logger.log('enrichLeads skipped: ' + spent + ' UrlFetch calls already spent today ' +
+               '(ceiling ' + UF_ENRICH_CEILING + '). Reporting keeps the rest.');
+    return;
+  }
+
   // ONE query for the work list, using the view rather than pulling fact_call and the whole
   // of dim_contact into memory and diffing them here. The old version fetched up to 50,000
   // dim_contact rows on every run purely to build a lookup set.
@@ -612,7 +673,9 @@ function enrichLeads(maxLeads) {
     Utilities.sleep(110);       // stay inside the account-wide rate limit
   }
   if (rows.length) sbUpsert_('dim_contact', rows);
-  Logger.log('enrichLeads: upserted ' + rows.length + ' of ' + wanted.length);
+  Logger.log('enrichLeads: upserted ' + rows.length + ' of ' + wanted.length +
+             ' (' + UF_CALLS + ' UrlFetch calls this run)');
+  ufFlush_();
 }
 
 function fetchLead_(prospectId) {
@@ -624,7 +687,7 @@ function fetchLead_(prospectId) {
     '&secretKey=' + encodeURIComponent(cfg_('LSQ_SECRET_KEY')) +
     '&id=' + encodeURIComponent(prospectId);
   try {
-    var res = UrlFetchApp.fetch(url, { method: 'get', muteHttpExceptions: true });
+    var res = ufFetch_(url, { method: 'get', muteHttpExceptions: true });
     if (res.getResponseCode() !== 200) return null;
     var body = JSON.parse(res.getContentText());
     var l = Array.isArray(body) ? body[0] : body;
@@ -698,6 +761,7 @@ function refreshReports() {
     failures.push('BUNDLE: ' + fatal);
     try { writeMeta_(failures, null, fetches); } catch (e2) { /* nothing left to do */ }
   } finally {
+    ufFlush_();
     lock.releaseLock();
   }
 }
@@ -1723,6 +1787,7 @@ function writeMeta_(failures, B, fetches) {
     // The quota is the thing that actually broke this workbook, so it gets a line. Apps
     // Script allows 20,000 UrlFetch calls a day across EVERY trigger, not per function.
     ['UrlFetch calls this refresh', (fetches || 0) + ' (was ~14 before the bundle)'],
+    ['UrlFetch spent today (all jobs)', ufSpentToday_() + UF_CALLS],
     ['Refresh cadence', 'every 30 min; enrichment every 15 min, bounded'],
     ['', ''],
     ['Tabs that failed to refresh', failures.length ? failures.join('  |  ') : 'none']
