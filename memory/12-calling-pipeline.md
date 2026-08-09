@@ -255,6 +255,41 @@ Its first version scanned the owner's whole book and was killed after 1,400 call
 holding 8,935 leads that is more expensive than the whole-team oracle it exists to be cheaper
 than. Narrow before you spend.
 
+## The deal book, fully loaded (2026-08-09)
+
+All 1,398 opportunities read through `GetOpportunityDetails`, 0 failures. Deduped to one deal
+per contact, the open book is:
+
+| | Deals |
+|---|---|
+| **Hot** (In Discussion / Agreement Sent / Invoice Sent) | **49** |
+| **Warm** (Requirement Gathering) | **91** |
+| **New** (Prospect, never progressed) | **979** |
+| Open, total | 1,119 |
+| Won (Payment Received) | 150 |
+
+**Only 4% of the open book is hot**, and 979 deals have never moved off the stage they were
+created at — 888 of those created across four days in late July by the opportunity backfill and
+the stage migration, not by a rep working a deal. That is a more useful number than deal size
+and it needed no new field.
+
+### Forecast field adoption, measured across all 1,398
+
+`Expected Deal Size` filled on **2**. `Expected Closure Date` on **7**. `Actual Deal Size` on
+**0**, including all 150 won deals.
+
+And the two that are filled do not survive a look:
+
+- One is the test record Kaustubh entered on 2026-08-09 (Rs 3,00,000).
+- The other carries a deal value of **4**. Not 4 lakh - four. A currency field with no
+  validation and no minimum.
+- 5 of the 7 close dates are the same date, `2026-08-31`, which reads as a default someone
+  clicked through rather than seven separate forecasts.
+
+So the honest count of genuine forecast data in the entire deal book is **one record, entered
+today, as a test**. The field-level fix (mandatory at In Discussion) has to come with
+validation, or the column fills with 4s.
+
 ## Still open
 
 - **Notes remain uncaptured** — `CallNotes` empty on every payload, confirming
