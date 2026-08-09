@@ -354,7 +354,12 @@ foreach ($lead in $todo) {
             continue
         }
 
-        if ($code -eq $Script:EVENT_OPPORTUNITY -or $code -eq $Script:EVENT_OPP_CAPTURED) {
+        # 12000 ONLY. EventCode 33 was included here until 2026-08-09 and is a fieldless
+        # shadow marker - same CreatedOn as the 12000 it accompanies, no ActivityFields at
+        # all, so it produced a second opportunity row per deal carrying a blank name, blank
+        # stage and blank status. 1,089 of 2,487 rows were these ghosts. Same family as 3002,
+        # which also arrives with no ActivityFields (gotcha 14).
+        if ($code -eq $Script:EVENT_OPPORTUNITY) {
             # Unbounded by date, like stage changes, and it MUST sit above the window gate
             # below. It did not until 2026-08-09: the gate came first, so every opportunity
             # created before -FromDate was dropped while the comment here claimed otherwise.

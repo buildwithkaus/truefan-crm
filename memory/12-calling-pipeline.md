@@ -138,9 +138,39 @@ Two smaller findings from the same probe:
   except `GetOpportunityTypes`, which returns `Fields: null`. The only way to learn the
   opportunity schema is to read a real opportunity.
 
-### Deal stages, enumerated live
+### Two ingestion bugs found while loading the deal book
 
-`Prospect` 117 · `Requirement Gathering` 15 · `In Discussion` 4. All 136 at status `Open`.
+**The date gate was above the opportunity branch.** `backfill.ps1` filtered activities to the
+reporting window *before* reaching the opportunity handler, whose own comment claimed the
+stream was unbounded. Phase 3 created 4,404 opportunities in July; the deal board showed
+**254**. It looked plausible and was internally consistent — the worst kind of wrong. After the
+fix the same 1,340-contact pass returned **2,382**.
+
+The tell was available and unread: `v_data_boundaries` would have shown the earliest
+opportunity landing exactly on the backfill start date. QC check 12 now compares the two
+supposedly-unbounded streams against the earliest call and fails if either is clipped.
+
+**EventCode 33 is a fieldless ghost.** It accompanies every 12000 on the same lead with the
+*same* `CreatedOn` and **no `ActivityFields` at all** — the same trap as 3002. Storing it as an
+opportunity produced a second, blank row per deal: **1,089 ghosts against 1,398 real ones**.
+Every ghost sat on a contact that already had a real deal, so removing them was lossless.
+Only 12000 is an opportunity.
+
+### The deal book, corrected
+
+**1,398 opportunities across 1,269 contacts. 1,248 Open, 150 Won.**
+
+| Deal stage | Count | Status |
+|---|---|---|
+| Prospect | 1,107 | Open |
+| Payment Received | 150 | Won |
+| Requirement Gathering | 91 | Open — **legacy** |
+| In Discussion | 50 | Open |
+
+**1,066 of 1,150 Prospect-stage contacts have a deal — 93%.** Worth recording that the buggy
+data said 22%, and that "78% of prospects have no opportunity" was one step from being reported
+as a business finding. It was an artifact of the date gate. *Check the pipeline before
+diagnosing the business.*
 
 `Requirement Gathering` is a **legacy value** that `scripts/lib/schema.ps1`
 (`OpportunityStageRenames`) specifies should have become `Prospect`. That rename is a UI edit

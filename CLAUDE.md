@@ -115,6 +115,9 @@ new script. One line each:
 14. The Activity record: PK is the top-level `Id`; `ActivityEvent_Note` has **duplicate keys**
     (take the last non-empty); 3002 has no `ActivityFields` at all; 203 and 22 reuse
     `mx_Custom_2/3` for different things; never branch on `Type`. Use `scripts/lib/activity.ps1`.
+    **EventCode 33 is the same trap as 3002** — it accompanies every 12000 on the same lead
+    with the *same* `CreatedOn` and no `ActivityFields`, so treating it as an opportunity
+    creates a blank ghost row per deal (1,089 ghosts against 1,398 real).
 15. `Webhook.svc`: `ActivityEvent` must ALSO go at the top level of the create body (docs say
     otherwise, and the doc's form 500s); `WebhookProperties` must be an escaped JSON *string*;
     `Delete` is a **GET**. A webhook endpoint must return **200 always** - ten non-200s disable

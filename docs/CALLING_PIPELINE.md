@@ -231,12 +231,29 @@ showing zero — zero would read as "nothing missing".
 
 ### Deal stages
 
-Enumerated live, not hardcoded: `Prospect` 117 · `Requirement Gathering` 15 · `In Discussion` 4,
-all at status `Open`. `Requirement Gathering` is a **legacy value** that
-`scripts/lib/schema.ps1` (`OpportunityStageRenames`) specifies should have become `Prospect`;
-that rename is a dropdown edit in the UI and was never applied. Same failure mode as the
-contact-stage drift found the day before — a migration recorded as complete with live records
-still on the old value. `v_deal_stage_drift` and QC check 10 watch it.
+Enumerated live, never hardcoded. As at 2026-08-09 — **1,398 opportunities, 1,248 Open,
+150 Won**:
+
+| Deal stage | Count | Status |
+|---|---|---|
+| Prospect | 1,107 | Open |
+| Payment Received | 150 | Won |
+| Requirement Gathering | 91 | Open — **legacy** |
+| In Discussion | 50 | Open |
+
+`Requirement Gathering` is a **legacy value** that `scripts/lib/schema.ps1`
+(`OpportunityStageRenames`) specifies should have become `Prospect`; that rename is a dropdown
+edit in the UI and was never applied. Same failure mode as the contact-stage drift found the
+day before — a migration recorded as complete with live records still on the old value.
+`v_deal_stage_drift` and QC check 10 watch it.
+
+**Only EventCode 12000 is an opportunity.** EventCode 33 accompanies it on the same lead with
+the same `CreatedOn` and no `ActivityFields` at all — ingesting it produced 1,089 blank ghost
+rows against 1,398 real ones. Same trap as 3002 (gotcha 14).
+
+**1,066 of 1,150 Prospect-stage contacts have a deal — 93%.** Before the date-gate fix the
+same query said 22%, and "78% of prospects have no opportunity" was one step from being
+reported as a finding about the team. Check the pipeline before diagnosing the business.
 
 The rest of the tab works before a single amount is entered: `overdue`, `stale` (14 days with
 no call) and `days open` need no deal value, so it is a deal-hygiene worklist from day one.

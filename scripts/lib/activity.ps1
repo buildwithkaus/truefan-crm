@@ -52,7 +52,11 @@ $Script:EVENT_CALL_INBOUND   = "21"
 $Script:EVENT_CALL_FORM      = "203"    # "01. Phone Call/ Follow Up" - the rep-facing form
 $Script:EVENT_STAGE_CHANGE   = "3002"
 $Script:EVENT_OPPORTUNITY    = "12000"
-$Script:EVENT_OPP_CAPTURED   = "33"
+# EventCode 33 accompanies a 12000 on the same lead with the SAME CreatedOn and NO
+# ActivityFields at all - it is a marker, not a deal. Never store it as an opportunity:
+# doing so produced 1,089 blank-stage ghost rows against 1,398 real ones. Kept as a named
+# constant so the next person recognises it rather than rediscovering it.
+$Script:EVENT_OPP_MARKER     = "33"
 $Script:EVENT_AI_CALL        = "208"    # Callkaro AI dialler - EXCLUDED, see below
 
 # The three activity names that mean "a human placed or took a call". Used to narrow the
