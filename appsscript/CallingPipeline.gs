@@ -40,6 +40,7 @@ var TABS = {
   REP_DAY: 'Rep Day',
   TREND: 'Daily Trend',
   PIPELINE: 'Pipeline State',
+  TEAMS: 'Teams',
   REP_FUNNEL: 'Rep Funnel',
   PROSPECTS: 'Prospects Daily',
   FUNNEL: 'Stage Movement',
@@ -57,13 +58,19 @@ var TABS = {
 // grey = plumbing.
 var TAB_COLOR = {
   'Dashboard': '#1f3864', 'Rep Day': '#1f3864', 'Daily Trend': '#1f3864',
-  'Pipeline State': '#188038', 'Rep Funnel': '#188038', 'Prospects Daily': '#188038',
+  'Pipeline State': '#188038', 'Teams': '#188038',
+  'Rep Funnel': '#188038', 'Prospects Daily': '#188038',
   'Stage Movement': '#188038', 'Deal Board': '#0b8043', 'Forecast': '#0b8043',
   'Exceptions': '#c5221f', 'QC': '#e37400',
   'Meta': '#80868b', 'Pending': '#80868b', 'Unparsed': '#80868b'
 };
 
 var IST_OFFSET_MS = 330 * 60 * 1000;
+
+// Every daily series starts here. This is the first date the backfill covers, so anything
+// earlier is a period the pipeline could not observe rather than a quiet day - showing it
+// would invite exactly the wrong conclusion. Widen it only when the backfill widens.
+var HISTORY_FROM = '2026-08-01';
 
 var EVT_CALL_OUT = '22';
 var EVT_CALL_IN = '21';
@@ -87,9 +94,16 @@ function setUp() {
   ensureSheet_(TABS.UNPARSED, ['ReceivedIst', 'Reason', 'Raw']);
 
   ScriptApp.getProjectTriggers().forEach(function (t) { ScriptApp.deleteTrigger(t); });
-  ScriptApp.newTrigger('refreshReports').timeBased().everyMinutes(10).create();
-  ScriptApp.newTrigger('enrichLeads').timeBased().everyMinutes(10).create();
-  ScriptApp.newTrigger('flushPending').timeBased().everyMinutes(5).create();
+  // UrlFetch budget, not taste. The quota is 20,000/day and the webhook ingest itself needs
+  // roughly one call per batch all day. At the old cadence - refresh every 10 minutes making
+  // ~14 reads, enrich every 10 minutes making up to 200 - the reports alone were spending
+  // more than the whole allowance and the last tabs to render simply failed.
+  //
+  // Now: refresh is 3 reads every 30 minutes (~144/day), enrich is bounded and only runs
+  // when there is genuinely something to enrich.
+  ScriptApp.newTrigger('refreshReports').timeBased().everyMinutes(30).create();
+  ScriptApp.newTrigger('enrichLeads').timeBased().everyMinutes(15).create();
+  ScriptApp.newTrigger('flushPending').timeBased().everyMinutes(10).create();
   Logger.log('Tabs created, triggers installed. Now deploy as a web app.');
 }
 
@@ -217,6 +231,38 @@ function sbUpsert_(table, rows) {
   var code = res.getResponseCode();
   if (code >= 300) throw new Error(table + ' upsert HTTP ' + code + ': ' + res.getContentText().slice(0, 400));
   return rows.length;
+}
+
+/**
+ * Fetch every report dataset in ONE call.
+ *
+ * refreshReports used to issue about fourteen separate PostgREST reads, every ten minutes.
+ * Together with enrichLeads that exhausted Apps Script's 20,000/day UrlFetch quota by
+ * mid-afternoon, and the tabs rendered last - Pipeline State, Exceptions, QC - died with
+ * "Service invoked too many times for one day". That reads like a code failure and is
+ * actually a budget failure, which is a slow thing to diagnose.
+ *
+ * report_bundle() returns all of them as one JSON document. The two genuinely large tables
+ * (Forecast, Exceptions) stay separate so no single payload gets unwieldy - three calls per
+ * refresh instead of fourteen.
+ */
+function sbBundle_(fromDate) {
+  var url = cfg_('SUPABASE_URL').replace(/\/+$/, '') + '/rest/v1/rpc/report_bundle';
+  var res = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      apikey: cfg_('SUPABASE_SERVICE_KEY'),
+      Authorization: 'Bearer ' + cfg_('SUPABASE_SERVICE_KEY')
+    },
+    payload: JSON.stringify({ p_from: fromDate || HISTORY_FROM }),
+    muteHttpExceptions: true
+  });
+  var code = res.getResponseCode();
+  if (code >= 300) {
+    throw new Error('report_bundle HTTP ' + code + ': ' + res.getContentText().slice(0, 400));
+  }
+  return JSON.parse(res.getContentText());
 }
 
 /** Read a view. `query` is a PostgREST querystring. */
@@ -481,31 +527,36 @@ function normalizeWebhookActivity_(item) {
  * Bounded per run: the LSQ daily cap is 10,000 calls and Apps Script stops at 6 minutes.
  */
 function enrichLeads(maxLeads) {
-  maxLeads = maxLeads || 200;
+  maxLeads = maxLeads || 120;
 
-  var missing = sbSelect_('fact_call',
-    'select=prospect_id&order=called_at_utc.desc&limit=4000', 4000);
-  var known = {};
-  var cached = sbSelect_('dim_contact', 'select=prospect_id', 50000);
-  for (var i = 0; i < cached.length; i++) known[cached[i].prospect_id] = true;
-
+  // ONE query for the work list, using the view rather than pulling fact_call and the whole
+  // of dim_contact into memory and diffing them here. The old version fetched up to 50,000
+  // dim_contact rows on every run purely to build a lookup set.
   var wanted = [], seen = {};
+  var missing = sbSelect_('v_calls_awaiting_enrichment',
+    'select=prospect_id&limit=' + maxLeads, maxLeads);
   for (var j = 0; j < missing.length; j++) {
     var pid = missing[j].prospect_id;
-    if (!pid || seen[pid] || known[pid]) continue;
+    if (!pid || seen[pid]) continue;
     seen[pid] = true;
     wanted.push(pid);
-    if (wanted.length >= maxLeads) break;
   }
 
-  // Nothing new? Refresh today's contacts instead, so stage/disposition stay current.
+  // Nothing new to enrich? Refresh contacts called today whose cached copy is genuinely
+  // STALE, so stage and disposition track what reps have since typed.
+  //
+  // This branch used to have no staleness test at all: once the backlog was clear it
+  // re-fetched 200 of today's contacts every single run. At a ten-minute trigger that is
+  // ~28,800 UrlFetch calls a day against a 20,000 quota, which is what took out Pipeline
+  // State, Exceptions and QC with "Service invoked too many times for one day". The cap and
+  // the two-hour floor are what keep this bounded.
   if (wanted.length === 0) {
-    var todays = sbSelect_('fact_call',
-      'select=prospect_id&call_date_ist=eq.' + istToday_() + '&limit=1000', 1000);
-    var s2 = {};
-    for (var t = 0; t < todays.length && wanted.length < maxLeads; t++) {
-      var p2 = todays[t].prospect_id;
-      if (p2 && !s2[p2]) { s2[p2] = true; wanted.push(p2); }
+    var staleBefore = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+    var stale = sbSelect_('v_contacts_needing_refresh',
+      'select=prospect_id&last_refreshed_at=lt.' + staleBefore + '&limit=40', 40);
+    for (var t = 0; t < stale.length && wanted.length < 40; t++) {
+      var p2 = stale[t].prospect_id;
+      if (p2 && !seen[p2]) { seen[p2] = true; wanted.push(p2); }
     }
   }
   if (wanted.length === 0) return;
@@ -562,24 +613,46 @@ function fetchLead_(prospectId) {
 function refreshReports() {
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) return;
+  var failures = [];
+  var fetches = 0;
   try {
-    // Each tab is wrapped so one failing view - a migration not yet run, a renamed column -
-    // cannot take the whole refresh down and leave every other tab stale. The failure is
-    // written onto the tab it belongs to, where someone will actually see it.
+    // ONE read for everything small and medium. Everything below renders from this object
+    // rather than issuing its own query - that is the whole point (see sbBundle_).
+    var B = sbBundle_(HISTORY_FROM);
+    fetches++;
+
     var tabs = [
-      ['Dashboard', writeDashboard_], ['Pipeline State', writePipelineState_],
-      ['Rep Day', writeRepDay_], ['Daily Trend', writeTrend_],
-      ['Stage Movement', writeFunnel_], ['Exceptions', writeExceptions_],
-      ['Prospects Daily', writeProspectsDaily_], ['Rep Funnel', writeRepFunnel_],
-      ['Deal Board', writeDeals_], ['Forecast', writeForecast_], ['QC', writeQc_]
+      ['Dashboard',       function () { writeDashboard_(B); }],
+      ['Rep Day',         function () { writeRepDay_(B); }],
+      ['Daily Trend',     function () { writeTrend_(B); }],
+      ['Pipeline State',  function () { writePipelineState_(B); }],
+      ['Teams',           function () { writeTeams_(B); }],
+      ['Rep Funnel',      function () { writeRepFunnel_(B); }],
+      ['Prospects Daily', function () { writeProspectsDaily_(B); }],
+      ['Stage Movement',  function () { writeFunnel_(B); }],
+      ['Deal Board',      function () { writeDeals_(B); }],
+      ['QC',              function () { writeQc_(B); }]
     ];
-    var failures = [];
     for (var i = 0; i < tabs.length; i++) {
+      // Each tab is wrapped so one failing view cannot take the whole refresh down and
+      // leave every other tab silently stale. The failure is listed on Meta.
       try { tabs[i][1](); }
       catch (e) { failures.push(tabs[i][0] + ': ' + e); }
     }
-    writeMeta_(failures);
+
+    // The two large tables, fetched individually so no single payload gets unwieldy.
+    try { writeForecast_(B); fetches++; }
+    catch (e) { failures.push('Forecast: ' + e); }
+    try { writeExceptions_(); fetches++; }
+    catch (e) { failures.push('Exceptions: ' + e); }
+
+    writeMeta_(failures, B, fetches);
     orderTabs_();
+  } catch (fatal) {
+    // The bundle itself failed - quota, a migration not run, a bad key. Say so on Meta
+    // rather than leaving every tab showing yesterday's numbers as though they were today's.
+    failures.push('BUNDLE: ' + fatal);
+    try { writeMeta_(failures, null, fetches); } catch (e2) { /* nothing left to do */ }
   } finally {
     lock.releaseLock();
   }
@@ -594,13 +667,13 @@ function refreshReports() {
  * every newly-invented value. Non-canonical ones are marked with an asterisk instead -
  * they are exactly the values reps cannot filter on in LSQ, so they need to be conspicuous.
  */
-function writeDashboard_(days) {
+function writeDashboard_(B, days) {
   days = days || 1;
   var from = istDaysAgo_(days - 1);
-  var pivot = sbSelect_('v_pivot_disposition',
-    'select=*&call_date_ist=gte.' + from + '&order=rep.asc', 20000);
-  var totals = sbSelect_('v_daily_totals',
-    'select=*&report_date=gte.' + from + '&order=report_date.desc', 400);
+  // Filtered from the bundle rather than re-queried. The bundle already carries the full
+  // window; slicing it here costs nothing and saves two UrlFetch calls per refresh.
+  var pivot = (B.pivot || []).filter(function (r) { return String(r.call_date_ist) >= from; });
+  var totals = (B.daily_totals || []).filter(function (r) { return String(r.report_date) >= from; });
 
   var sh = ensureSheet_(TABS.DASHBOARD);
   sh.clear();
@@ -773,11 +846,11 @@ function writeDashboard_(days) {
  * Fails soft. If the snapshot job has never run the tab says so plainly rather than showing
  * an empty grid that reads as "this rep holds nothing".
  */
-function writePipelineState_() {
+function writePipelineState_(B) {
   var rows, coverage;
   try {
-    rows = sbSelect_('v_pipeline_state_wide', 'select=*&order=book_size.desc', 200);
-    coverage = sbSelect_('v_book_coverage', 'select=*', 200);
+    rows = withTeam_(B.pipeline_state || []);
+    coverage = B.book_coverage || [];
   } catch (e) {
     var shx = ensureSheet_(TABS.PIPELINE);
     shx.clear();
@@ -808,6 +881,7 @@ function writePipelineState_() {
   }
 
   var sh = writeTable_(TABS.PIPELINE, [
+    ['team', 'Team'],
     ['rep', 'Rep'],
     ['book_size', 'Book size'],
     ['workable', 'Workable'],
@@ -825,57 +899,142 @@ function writePipelineState_() {
   ], rows,
     'What each rep HOLDS, from the daily book snapshot. "Workable" excludes Customers and ' +
     'Disqualified. "Coverage 7d" is the share of the workable book actually dialled in the ' +
-    'last week - high call volume with low coverage means the same contacts are being redialled.');
+    'last week - high call volume with low coverage means the same contacts are being redialled.',
+    { teamKey: 'team' });
 
   // Highlight the two columns worth acting on: a book that is mostly untouched, and a book
   // that is barely being covered. Thresholds are deliberately blunt - this is a prompt to
-  // look, not a verdict.
+  // look, not a verdict. Column indexes shift by one now that Team leads the table.
   var hRow = 4;
   for (var r = 0; r < rows.length; r++) {
     if (Number(rows[r].pct_untouched) >= 70) {
-      sh.getRange(hRow + r, 10).setBackground(THEME.warn);
+      sh.getRange(hRow + r, 11).setBackground(THEME.warn);
     }
     if (Number(rows[r].coverage_7d_pct) < 10) {
-      sh.getRange(hRow + r, 13).setBackground(THEME.bad);
+      sh.getRange(hRow + r, 14).setBackground(THEME.bad);
     }
   }
   return sh;
 }
 
-function writeRepDay_() {
-  var rows = sbSelect_('v_rep_day',
-    'select=*&report_date=gte.' + istDaysAgo_(7) + '&order=report_date.desc,dials.desc', 3000);
+function writeRepDay_(B) {
+  var rows = withTeam_(B.rep_day);
   writeTable_(TABS.REP_DAY,
-    [['report_date', 'Date'], ['rep', 'Rep'], ['dials', 'Dials'], ['contacts', 'Contacts'],
+    [['report_date', 'Date'], ['team', 'Team'], ['rep', 'Rep'],
+     ['dials', 'Dials'], ['contacts', 'Contacts'],
      ['connects', 'Connects'], ['connect_rate_pct', 'Connect %'], ['talk_min', 'Talk (min)'],
      ['inbound_calls', 'Inbound'],
      ['called_fresh', 'At Fresh'], ['called_engaged', 'At Engaged'], ['called_prospect', 'At Prospect'],
      ['called_customer', 'At Customer'], ['called_disqualified', 'At Disq'],
-     ['contacts_updated', 'Updated'], ['discipline_pct', 'Discipline %'], ['clean_pct', 'Clean %'],
+     ['contacts_updated', 'Contacts updated'], ['discipline_pct', 'Discipline %'], ['clean_pct', 'Clean %'],
      ['gap_still_fresh', 'Gap: Fresh'], ['gap_no_disposition', 'Gap: No Disp'],
      ['gap_no_reason', 'Gap: No Reason'], ['gap_contradicts', 'Gap: Contradicts'],
      ['gap_bad_value', 'Gap: Bad Value']],
     rows,
-    'Per rep per day, last 7 days. Read Clean % beside "Contradicts" - a jump straight after ' +
-    'a batch cleanup means re-staging happened, not dispositioning.');
+    'Per rep per day from ' + HISTORY_FROM + '. "Contacts updated" is a COUNT of contacts ' +
+    'whose stage moved at or after the call, not a timestamp. Read Clean % beside ' +
+    '"Contradicts" - a jump straight after a batch cleanup means re-staging happened, ' +
+    'not dispositioning.');
 }
 
-function writeTrend_() {
-  var rows = sbSelect_('v_daily_totals', 'select=*&order=report_date.desc', 400);
-  writeTable_(TABS.TREND,
-    [['report_date', 'Date'], ['dials', 'Dials'], ['connects', 'Connects'],
-     ['connect_rate_pct', 'Connect %'], ['contacts', 'Contacts'],
-     ['active_reps', 'Active reps'], ['talk_min', 'Talk (min)']],
-    rows, 'Whole-team totals by day. This is the month-over-month view.');
+/**
+ * DAILY TREND - team totals per day, then one column per call disposition.
+ *
+ * The disposition columns are generated from the data. A fixed list would silently drop
+ * every newly invented value, and on this account those appear faster than the existing
+ * ones get used correctly.
+ */
+function writeTrend_(B) {
+  var totals = B.daily_totals || [];
+  var disp = B.daily_disp || [];
+
+  // Pivot dispositions into columns, busiest first.
+  var byDate = {}, dispTotals = {};
+  for (var i = 0; i < disp.length; i++) {
+    var d = disp[i];
+    var key = String(d.report_date);
+    if (!byDate[key]) byDate[key] = {};
+    byDate[key][d.disposition] = (byDate[key][d.disposition] || 0) + Number(d.calls || 0);
+    dispTotals[d.disposition] = (dispTotals[d.disposition] || 0) + Number(d.calls || 0);
+  }
+  var dispCols = Object.keys(dispTotals).sort(function (a, b) { return dispTotals[b] - dispTotals[a]; });
+
+  var rows = [];
+  for (var t = 0; t < totals.length; t++) {
+    var r = totals[t];
+    var out = {
+      report_date: r.report_date, dials: r.dials, connects: r.connects,
+      connect_rate_pct: r.connect_rate_pct, contacts: r.contacts,
+      active_reps: r.active_reps, talk_min: r.talk_min,
+      owner_dials: r.owner_dials, inherited_dials: r.inherited_dials
+    };
+    var dd = byDate[String(r.report_date)] || {};
+    for (var c = 0; c < dispCols.length; c++) out['d' + c] = dd[dispCols[c]] || '';
+    rows.push(out);
+  }
+
+  var colDefs = [['report_date', 'Date'], ['dials', 'Dials'], ['connects', 'Connects'],
+                 ['connect_rate_pct', 'Connect %'], ['contacts', 'Contacts'],
+                 ['active_reps', 'Active reps'], ['talk_min', 'Talk (min)'],
+                 ['owner_dials', 'Own book'], ['inherited_dials', 'Inherited']];
+  for (var c2 = 0; c2 < dispCols.length; c2++) colDefs.push(['d' + c2, dispCols[c2]]);
+
+  writeTable_(TABS.TREND, colDefs, rows,
+    'Whole-team totals by day from ' + HISTORY_FROM + ', then one column per call ' +
+    'disposition. "<no history>" is every call before the disposition webhook went live on ' +
+    '2026-08-08 - that history was never kept and cannot be reconstructed. "Inherited" is ' +
+    'calls made on a contact the dialler does not own; they count in Dials but never ' +
+    'against a rep.');
 }
 
-function writeFunnel_() {
-  var rows = sbSelect_('v_funnel_movement',
-    'select=*&report_date=gte.' + istDaysAgo_(30) + '&order=report_date.desc', 5000);
+function writeFunnel_(B) {
   writeTable_(TABS.FUNNEL,
-    [['report_date', 'Date'], ['rep', 'Rep'], ['from_stage', 'From'], ['to_stage', 'To'],
+    [['report_date', 'Date'], ['rep', 'Moved by'], ['from_stage', 'From'], ['to_stage', 'To'],
      ['contacts', 'Contacts']],
-    rows, 'Stage movement - calls measure effort, this measures progress.');
+    B.movement || [],
+    'Every contact-stage transition from ' + HISTORY_FROM + '. Calls measure effort; this ' +
+    'measures progress. Attributed to whoever made the change, so bulk and system writes ' +
+    'appear under their own name rather than inflating a rep.');
+}
+
+/**
+ * Attach team and sort order to any row carrying a `rep` field, so every rep-facing tab
+ * groups the same way. Reps who are not on the org chart land in "Unassigned" rather than
+ * disappearing - Irfan Mahmood, Shriyanka Gupta and Admin all hold real books.
+ */
+function withTeam_(rows) {
+  var map = teamMap_();
+  var out = (rows || []).map(function (r) {
+    var key = String(r.rep || '').toLowerCase().replace(/^\s+|\s+$/g, '');
+    var t = map[key];
+    var o = {};
+    for (var k in r) o[k] = r[k];
+    o.team = t ? t.team : 'Unassigned';
+    o._teamSort = t ? t.sort : 900;
+    return o;
+  });
+  // Stable: team first, then whatever order the view returned within the team.
+  return out;
+}
+
+var TEAM_MAP_CACHE = null;
+function teamMap_() {
+  if (TEAM_MAP_CACHE) return TEAM_MAP_CACHE;
+  var m = {};
+  try {
+    var rows = sbSelect_('dim_team', 'select=rep_name,team,is_lead,sort_order', 200);
+    for (var i = 0; i < rows.length; i++) {
+      var teamRank = rows[i].team === 'Team #ONE' ? 1 : (rows[i].team === 'Team Achievers' ? 2 : 8);
+      m[rows[i].rep_name] = {
+        team: rows[i].team,
+        sort: teamRank * 100 + (rows[i].is_lead ? 0 : 10) + Number(rows[i].sort_order || 0)
+      };
+    }
+  } catch (e) {
+    // No team table yet - everything reads as Unassigned, which is honest.
+  }
+  TEAM_MAP_CACHE = m;
+  return m;
 }
 
 function writeExceptions_() {
@@ -913,9 +1072,8 @@ function writeExceptions_() {
  * counts on the day it was promoted. Reading current stage instead would delete a rep's
  * work retroactively every time a deal went bad.
  */
-function writeProspectsDaily_() {
-  var rows = sbSelect_('v_prospects_daily',
-    'select=*&report_date=gte.' + istDaysAgo_(29) + '&order=report_date.desc', 5000);
+function writeProspectsDaily_(B) {
+  var rows = B.prospects_daily || [];
 
   var sh = ensureSheet_(TABS.PROSPECTS);
   sh.clear();
@@ -999,48 +1157,135 @@ function buildMatrix_(rows, rowKey, colKey, valKey) {
 }
 
 /**
- * REP FUNNEL - book to closed deal, one row per rep.
+ * TEAMS - the org chart, and the same numbers rolled up to team level.
  *
- * Deliberately starts from the assigned BOOK, not from contacts that have been touched. A
- * funnel drawn only on touched contacts always looks healthy because the untouched majority
- * is invisible; on this account that majority is most of the book (one rep is at 1.5%
- * coverage). Book size and workable sit in the same row as the conversions so the gap
- * cannot be read past.
+ * Exists because every rep-facing tab is read by team, and because a reader needs somewhere
+ * to see who reports to whom without opening another document.
  */
-function writeRepFunnel_() {
-  var rows = sbSelect_('v_funnel_rep', 'select=*&order=workable.desc', 200);
+function writeTeams_(B) {
+  var teams = B.team_summary || [];
+  var reps = B.rep_funnel || [];
+
+  var sh = ensureSheet_(TABS.TEAMS);
+  sh.clear();
+  clearBandings_(sh);
+  sh.setHiddenGridlines(true);
+
+  var r = renderTable_(sh, 1, 'Team totals', [
+    ['team', 'Team'], ['reps', 'Reps'],
+    ['book_size', 'Book'], ['workable', 'Workable'],
+    ['fresh', 'Fresh'], ['engaged', 'Engaged'], ['prospect', 'Prospect'],
+    ['called_30d', 'Called 30d'], ['coverage_pct', 'Coverage %'],
+    ['dials_30d', 'Dials 30d'], ['connects_30d', 'Connects 30d'], ['connect_pct', 'Connect %'],
+    ['new_prospects_30d', 'New prospects 30d'],
+    ['deals', 'Deals'], ['hot', 'Hot'], ['warm', 'Warm'], ['won', 'Won']
+  ], teams,
+    'Rolled up from the same rows as Rep Funnel, so the two always agree.',
+    { freeze: true, filter: false });
+
+  renderTable_(sh, r, 'Who is on which team', [
+    ['team', 'Team'], ['lead', 'Team lead'], ['rep', 'Rep'], ['role', 'Role'],
+    ['book_size', 'Book'], ['workable', 'Workable'], ['deals', 'Deals'], ['hot', 'Hot']
+  ], buildRoster_(reps),
+    'Anyone holding a book who is not on the org chart appears under Unassigned rather than ' +
+    'being dropped - they still own real contacts.',
+    { freeze: false, teamKey: 'team' });
+
+  sh.setColumnWidth(1, 150); sh.setColumnWidth(2, 150); sh.setColumnWidth(3, 170);
+  return sh;
+}
+
+function buildRoster_(repRows) {
+  var map = teamMap_();
+  var leadOf = {};
+  try {
+    var rows = sbSelect_('dim_team', 'select=rep_name,display_name,team,team_lead,is_lead', 200);
+    for (var i = 0; i < rows.length; i++) leadOf[rows[i].rep_name] = rows[i];
+  } catch (e) { /* no team table yet */ }
+
+  return (repRows || []).map(function (r) {
+    var key = String(r.rep || '').toLowerCase().replace(/^\s+|\s+$/g, '');
+    var t = leadOf[key];
+    return {
+      team: r.team || 'Unassigned',
+      lead: t ? t.team_lead : '',
+      rep: t ? t.display_name : r.rep,
+      role: t ? (t.is_lead ? 'Team lead' : 'Rep') : 'Not on the org chart',
+      book_size: r.book_size, workable: r.workable, deals: r.deals, hot: r.hot
+    };
+  });
+}
+
+/**
+ * REP FUNNEL, rebuilt so every column has exactly one meaning.
+ *
+ * Two blocks, kept apart on purpose:
+ *
+ *   THE BOOK - what the rep holds right now. Fresh + Engaged + Prospect + Customer +
+ *   Disqualified + Other equals Book exactly. The old version's columns did not add up to
+ *   anything, which is why they could not be explained.
+ *
+ *   THE WORK - what the rep did in the last 30 days, and their deal book.
+ *
+ * "Touched" is gone. It counted rows in a modelling view rather than anything a rep would
+ * recognise. "Called 30d" replaces it and means what it says: distinct contacts this rep
+ * personally dialled.
+ *
+ * Prospect and Deals sit next to each other with the gap between them, because the
+ * operational rule is that they should be equal - every Prospect contact carries an
+ * opportunity. Showing both makes the missing ones visible rather than implied.
+ */
+function writeRepFunnel_(B) {
+  var rows = (B.rep_funnel || []).slice();
 
   var sh = writeTable_(TABS.REP_FUNNEL, [
+    ['team', 'Team'],
     ['rep', 'Rep'],
+    // --- the book, today ---
     ['book_size', 'Book'],
     ['workable', 'Workable'],
-    ['untouched_fresh', 'Still Fresh'],
-    ['in_journey', 'Touched'],
+    ['fresh', 'Fresh'],
     ['engaged', 'Engaged'],
     ['prospect', 'Prospect'],
-    ['opportunities', 'Opps'],
-    ['won', 'Won'],
-    ['lost', 'Lost'],
+    ['customer', 'Customer'],
     ['disqualified', 'Disqualified'],
-    ['book_to_engaged_pct', 'Book>Engaged %'],
-    ['engaged_to_prospect_pct', 'Engaged>Prospect %'],
-    ['prospect_to_opp_pct', 'Prospect>Opp %'],
-    ['win_rate_pct', 'Win rate %']
+    ['off_taxonomy', 'Off-taxonomy'],
+    // --- the work, last 30 days ---
+    ['called_30d', 'Called 30d'],
+    ['coverage_pct', 'Coverage %'],
+    ['dials_30d', 'Dials 30d'],
+    ['connects_30d', 'Connects 30d'],
+    ['connect_pct', 'Connect %'],
+    ['new_prospects_30d', 'New prospects 30d'],
+    ['disqualified_30d', 'Disqualified 30d'],
+    // --- the deal book ---
+    ['deals', 'Deals'],
+    ['prospects_missing_deal', 'Prospects w/o deal'],
+    ['new_deals', 'Deals: New'],
+    ['warm', 'Deals: Warm'],
+    ['hot', 'Deals: Hot'],
+    ['hot_pct', 'Hot %'],
+    ['won', 'Won'],
+    ['lost', 'Lost']
   ], rows,
-    'The whole funnel per rep. "Workable" is Fresh + Engaged + Prospect from today\'s book ' +
-    'snapshot. "Prospect>Opp %" below 100 means prospects exist with no opportunity behind ' +
-    'them - the operational rule says every Prospect should have one.');
+    'THE BOOK (Fresh..Off-taxonomy add up to Book) | THE WORK, last 30 days | THE DEAL BOOK. ' +
+    '"Called 30d" is distinct contacts this rep personally dialled - a previous owner\'s ' +
+    'calls on an inherited contact do not count. "Coverage %" is Called / Workable. ' +
+    '"Prospects w/o deal" should be zero: the rule is every Prospect carries an opportunity.',
+    { teamKey: 'team' });
 
-  // Amber where the funnel leaks at the step this team controls directly.
   // Body starts at row 4: title 1, subtitle 2, header 3.
   var bodyStart = 4;
   for (var i = 0; i < rows.length; i++) {
-    var p2o = Number(rows[i].prospect_to_opp_pct);
-    if (Number(rows[i].prospect) > 0 && (isNaN(p2o) || p2o < 100)) {
-      sh.getRange(bodyStart + i, 14).setBackground(THEME.warn);
+    if (Number(rows[i].prospects_missing_deal) > 0) {
+      sh.getRange(bodyStart + i, 19).setBackground(THEME.warn);
     }
-    if (Number(rows[i].book_to_engaged_pct) < 10) {
+    var cov = Number(rows[i].coverage_pct);
+    if (Number(rows[i].workable) > 100 && (isNaN(cov) || cov < 10)) {
       sh.getRange(bodyStart + i, 12).setBackground(THEME.bad);
+    }
+    if (Number(rows[i].off_taxonomy) > 0) {
+      sh.getRange(bodyStart + i, 10).setBackground(THEME.warn);
     }
   }
   return sh;
@@ -1053,10 +1298,9 @@ function writeRepFunnel_() {
  * matrix underneath answers "where do open deals actually sit". Stage names come from the
  * data, never from a hardcoded list, so an invented stage shows up rather than vanishing.
  */
-function writeDeals_() {
-  var board = sbSelect_('v_deal_board', 'select=*&order=open_opps.desc', 200);
-  var detail = sbSelect_('v_deal_stage_detail',
-    'select=*&status=eq.Open&order=stage_rank.asc', 2000);
+function writeDeals_(B) {
+  var board = withTeam_(B.deal_board || []);
+  var detail = B.deal_detail || [];
 
   var sh = ensureSheet_(TABS.DEALS);
   sh.clear();
@@ -1091,21 +1335,27 @@ function writeDeals_() {
   ]);
 
   r = renderTable_(sh, r, 'Deal book per rep', [
+    ['team', 'Team'],
     ['rep', 'Rep'],
     ['total_opps', 'Total'],
     ['open_opps', 'Open'],
+    ['hot', 'Hot'],
+    ['warm', 'Warm'],
+    ['new_unqualified', 'New'],
     ['won', 'Won'],
     ['lost', 'Lost'],
-    ['other_status', 'Other'],
     ['win_rate_pct', 'Win rate %'],
+    ['hot_known_value', 'Hot value (known)'],
     ['open_known_value', 'Open value (known)'],
-    ['won_value', 'Won value'],
+    ['won_actual_value', 'Won value (actual)'],
     ['open_unvalued', 'Open, no value'],
     ['open_no_close_date', 'Open, no close date']
   ], board,
-    'Win rate is Won / (Won + Lost) - open deals are excluded from the denominator, ' +
-    'otherwise a rep with a healthy pipeline looks like they are losing.',
-    { freeze: true });
+    'Hot = In Discussion, Agreement Sent, Invoice Sent. Warm = Requirement Gathering. ' +
+    'New = Prospect, created but never progressed. Win rate is Won / (Won + Lost); open ' +
+    'deals are excluded from the denominator, otherwise a rep with a healthy pipeline looks ' +
+    'like they are losing.',
+    { freeze: true, teamKey: 'team' });
 
   if (detail.length) {
     var m = buildMatrix_(detail, 'rep', 'stage', 'opportunities');
@@ -1136,10 +1386,12 @@ function writeDeals_() {
  * The list is still useful before a single amount is entered: days open, days since last
  * call, overdue and stale work on every row regardless of value.
  */
-function writeForecast_() {
+function writeForecast_(B) {
+  // The one genuinely large table left as its own read - 1,100+ rows of 28 columns does not
+  // belong inside a bundle shared with every other tab.
   var deals = sbSelect_('v_forecast',
-    'select=*&order=expected_close_date.asc.nullslast,days_open.desc', 3000);
-  var quality = sbSelect_('v_forecast_quality', 'select=*&order=open_opps.desc', 200);
+    'select=*&order=temp_rank.asc,expected_close_date.asc.nullslast,days_open.desc', 3000);
+  var quality = withTeam_(B.forecast_quality || []);
 
   var sh = ensureSheet_(TABS.FORECAST);
   sh.clear();
@@ -1210,8 +1462,10 @@ function writeForecast_() {
   r += 2;
 
   r = renderTable_(sh, r, 'Forecast coverage per rep', [
+    ['team', 'Team'],
     ['rep', 'Rep'],
     ['open_opps', 'Open deals'],
+    ['hot_opps', 'Hot'],
     ['with_value', 'Has value'],
     ['with_close_date', 'Has close date'],
     ['forecastable', 'Forecastable'],
@@ -1226,13 +1480,14 @@ function writeForecast_() {
     'Read "Coverage %" first. Everything to the right of it is only as trustworthy as that ' +
     'number. A rep with no valued deals shows a blank average rather than zero, because ' +
     'zero would read as "nothing missing".',
-    { freeze: true });
+    { freeze: true, filter: false, teamKey: 'team' });
 
   r = renderTable_(sh, r, 'Open deals', [
     ['rep', 'Rep'],
     ['company_name', 'Company'],
     ['contact_name', 'Contact'],
     ['opportunity_name', 'Opportunity'],
+    ['temperature', 'Temp'],
     ['stage', 'Stage'],
     ['deal_value', 'Deal value'],
     ['expected_close_date', 'Expected close'],
@@ -1243,9 +1498,15 @@ function writeForecast_() {
     ['connects', 'Connects'],
     ['prospect_id', 'ProspectId']
   ], deals,
-    'Sorted by expected close date, deals with no date last. Amber = no deal value. ' +
-    'Red = past its close date or untouched for 14 days.',
+    'Hot deals first, then warm, then new; within each, soonest expected close first and ' +
+    'deals with no date last. Amber = no deal value. Red = past its close date or untouched ' +
+    'for 14 days.',
     { freeze: false });
+
+  // Widths are derived, not counted by hand. Inserting the Temp column shifted Deal value
+  // from column 6 to 7, and a hardcoded index would have silently formatted the wrong one.
+  var DEAL_COLS = 14;
+  var DEAL_VALUE_COL = 7;
 
   // Flag the rows that need work, straight from the SQL booleans rather than from a
   // spreadsheet formula reading the displayed cells. A formula would have to re-derive
@@ -1258,12 +1519,14 @@ function writeForecast_() {
   for (var d2 = 0; d2 < deals.length; d2++) {
     var row = deals[d2];
     if (row.overdue || row.stale) {
-      sh.getRange(bodyStart + d2, 1, 1, 13).setBackground(THEME.bad);
+      sh.getRange(bodyStart + d2, 1, 1, DEAL_COLS).setBackground(THEME.bad);
     } else if (row.missing_value || row.missing_close_date) {
-      sh.getRange(bodyStart + d2, 1, 1, 13).setBackground(THEME.warn);
+      sh.getRange(bodyStart + d2, 1, 1, DEAL_COLS).setBackground(THEME.warn);
     }
   }
-  sh.getRange(bodyStart, 6, deals.length, 1).setNumberFormat('"₹"#,##0');
+  if (deals.length) {
+    sh.getRange(bodyStart, DEAL_VALUE_COL, deals.length, 1).setNumberFormat('"₹"#,##0');
+  }
 
   sh.setColumnWidth(1, 150); sh.setColumnWidth(2, 210); sh.setColumnWidth(3, 150);
   sh.setColumnWidth(4, 210);
@@ -1279,11 +1542,12 @@ function writeForecast_() {
  * underneath states what the data physically cannot know, so an empty column is never
  * mistaken for a zero.
  */
-function writeQc_() {
-  var checks, bounds;
+function writeQc_(B) {
+  var checks, bounds, hygiene;
   try {
-    checks = sbSelect_('v_qc_pipeline', 'select=*&order=seq.asc', 100);
-    bounds = sbSelect_('v_data_boundaries', 'select=*', 100);
+    checks = B.qc || [];
+    bounds = B.boundaries || [];
+    hygiene = B.hygiene || [];
   } catch (e) {
     var shx = ensureSheet_(TABS.QC);
     shx.clear();
@@ -1334,6 +1598,14 @@ function writeQc_() {
     if (bg) sh.getRange(top + c, 4).setBackground(bg).setFontWeight('bold');
   }
 
+  r = renderTable_(sh, r, 'CRM hygiene backlog', [
+    ['issue', 'Issue'],
+    ['items', 'Items']
+  ], hygiene,
+    'Not pipeline defects - CRM state that needs clearing. Each has a different fix; the ' +
+    'full worklist is in v_opportunity_hygiene.',
+    { freeze: false, filter: false });
+
   renderTable_(sh, r, 'What the data can and cannot know', [
     ['stream', 'Stream'],
     ['row_count', 'Rows'],
@@ -1343,7 +1615,7 @@ function writeQc_() {
   ], bounds,
     'Read this before quoting any historical number. A blank is not a zero - it is a period ' +
     'the pipeline could not observe.',
-    { freeze: false });
+    { freeze: false, filter: false });
 
   sh.setColumnWidth(1, 300); sh.setColumnWidth(2, 110); sh.setColumnWidth(3, 110);
   sh.setColumnWidth(4, 110); sh.setColumnWidth(5, 620);
@@ -1357,9 +1629,9 @@ function writeQc_() {
  */
 function orderTabs_() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var order = [TABS.DASHBOARD, TABS.REP_DAY, TABS.TREND, TABS.PIPELINE, TABS.REP_FUNNEL,
-               TABS.PROSPECTS, TABS.FUNNEL, TABS.DEALS, TABS.FORECAST, TABS.EXCEPTIONS,
-               TABS.QC, TABS.META, TABS.PENDING, TABS.UNPARSED];
+  var order = [TABS.DASHBOARD, TABS.REP_DAY, TABS.TREND, TABS.TEAMS, TABS.PIPELINE,
+               TABS.REP_FUNNEL, TABS.PROSPECTS, TABS.FUNNEL, TABS.DEALS, TABS.FORECAST,
+               TABS.EXCEPTIONS, TABS.QC, TABS.META, TABS.PENDING, TABS.UNPARSED];
   for (var i = 0; i < order.length; i++) {
     var sh = ss.getSheetByName(order[i]);
     if (!sh) continue;
@@ -1371,9 +1643,9 @@ function orderTabs_() {
   if (first) ss.setActiveSheet(first);
 }
 
-function writeMeta_(failures) {
+function writeMeta_(failures, B, fetches) {
   failures = failures || [];
-  var h = sbSelect_('v_pipeline_health', 'select=*', 1)[0] || {};
+  var h = (B && B.health) ? B.health : {};
   var pending = Math.max(0, ensureSheet_(TABS.PENDING).getLastRow() - 1);
   var unparsed = Math.max(0, ensureSheet_(TABS.UNPARSED).getLastRow() - 1);
   var mins = Number(h.minutes_since_last_ingest);
@@ -1402,6 +1674,11 @@ function writeMeta_(failures) {
     ['', ''],
     ['Disposition history', 'exact from 2026-08-08; "<no history>" before that is by design'],
     ['Notes', 'NOT captured - this reports what happened, not why'],
+    ['', ''],
+    // The quota is the thing that actually broke this workbook, so it gets a line. Apps
+    // Script allows 20,000 UrlFetch calls a day across EVERY trigger, not per function.
+    ['UrlFetch calls this refresh', (fetches || 0) + ' (was ~14 before the bundle)'],
+    ['Refresh cadence', 'every 30 min; enrichment every 15 min, bounded'],
     ['', ''],
     ['Tabs that failed to refresh', failures.length ? failures.join('  |  ') : 'none']
   ];
@@ -1447,6 +1724,7 @@ var THEME = {
   titleSize: 15,
   subtitleFg: '#5f6368',
   band: '#f4f6fa',
+  teamBand: '#eef3f8',
   border: '#d6dbe4',
   totalBg: '#eef1f6',
   good: '#e6f4ea',
@@ -1460,17 +1738,38 @@ var THEME = {
  * declare formats. Key naming in the views is already consistent (_pct, _date, counts), and
  * inference keeps the column definitions short enough to read.
  */
+function endsWith_(s, suffix) {
+  return s.length >= suffix.length && s.substring(s.length - suffix.length) === suffix;
+}
+
+/**
+ * SUFFIX matching, not substring. The previous version tested k.indexOf('date') >= 0, which
+ * matches "contacts_upDATEd" - so a count of 14 was given a date format and rendered as
+ * 14 January 1900. Sheets was doing exactly what it was told: 14 is day 14 of the 1900
+ * epoch. Substring matching on column names is a trap; 'rate' had the same problem.
+ *
+ * Order matters. *_date_ist is a date, *_at_ist is a timestamp, and both end in _ist.
+ */
 function colType_(key, rows) {
   var k = String(key).toLowerCase();
-  if (k.indexOf('_pct') >= 0 || k.indexOf('rate') >= 0) return 'pct';
-  if (k.indexOf('date') >= 0) return 'date';
-  if (k.indexOf('_ist') >= 0 || k.indexOf('_utc') >= 0) return 'datetime';
-  if (k.indexOf('min') >= 0 || k.indexOf('talk') >= 0) return 'dec';
+
+  if (endsWith_(k, '_pct')) return 'pct';
+  if (endsWith_(k, '_utc')) return 'datetime';
+  if (endsWith_(k, '_ist')) return endsWith_(k, '_date_ist') ? 'date' : 'datetime';
+  if (endsWith_(k, '_date') || k === 'as_of' || k === 'earliest' || k === 'latest') return 'date';
+  if (endsWith_(k, '_min') || k === 'talk_min') return 'dec';
+
+  // Fall back to the values. A name-based rule cannot know that oldest_opp_created is a
+  // timestamp, and guessing from the name is what caused the bug above.
   for (var i = 0; i < rows.length && i < 40; i++) {
     var v = rows[i][key];
     if (v === null || v === undefined || v === '') continue;
     if (typeof v === 'boolean') return 'bool';
     if (typeof v === 'number') return 'int';
+    if (typeof v === 'string') {
+      if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(v)) return 'datetime';
+      if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return 'date';
+    }
     return 'text';
   }
   return 'text';
@@ -1578,6 +1877,32 @@ function renderTable_(sh, startRow, title, colDefs, rows, subtitle, opts) {
       .setBackground(THEME.totalBg).setFontWeight('bold');
   }
 
+  // Tint each team's block so the grouping is visible without breaking the filter. A team
+  // header ROW would read more like the org chart, but Sheets filters treat any such row as
+  // data and sorting would scatter them - so the team lives in a column and the colour just
+  // makes the boundary easy to find.
+  if (opts.teamKey) {
+    var prev = null, band = false;
+    for (var tr = 0; tr < rows.length; tr++) {
+      var tv = rows[tr][opts.teamKey];
+      if (tv !== prev) { band = !band; prev = tv; }
+      if (band) sh.getRange(bRow + tr, 1, 1, w).setBackground(THEME.teamBand);
+    }
+  }
+
+  // A filter on every header. Sheets allows exactly ONE filter per sheet, so a multi-block
+  // tab gets it on whichever block asks first - which is why the big table on each tab asks
+  // and the summary blocks above it do not.
+  if (opts.filter !== false) {
+    try {
+      var existing = sh.getFilter();
+      if (existing) existing.remove();
+      sh.getRange(hRow, 1, body.length + 1, w).createFilter();
+    } catch (e) {
+      // A sheet can refuse a second filter; not worth failing the whole refresh over.
+    }
+  }
+
   if (opts.freeze) sh.setFrozenRows(hRow);
   return bRow + body.length + 2;
 }
@@ -1675,5 +2000,8 @@ function istToday_() { return new Date(Date.now() + IST_OFFSET_MS).toISOString()
 function istDaysAgo_(n) { return new Date(Date.now() + IST_OFFSET_MS - n * 86400000).toISOString().slice(0, 10); }
 
 /** Convenience for the editor: widen the dashboard to a week or a month. */
-function dashboardWeek() { writeDashboard_(7); }
-function dashboardMonth() { writeDashboard_(30); }
+// Manual helpers. They fetch their own bundle because they are run by hand from the editor,
+// not from the trigger - the signature changed when the bundle landed and passing a number
+// as the bundle would have silently rendered an empty dashboard.
+function dashboardWeek()  { writeDashboard_(sbBundle_(HISTORY_FROM), 7); }
+function dashboardMonth() { writeDashboard_(sbBundle_(HISTORY_FROM), 30); }
