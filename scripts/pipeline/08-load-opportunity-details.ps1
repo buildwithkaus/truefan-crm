@@ -97,8 +97,15 @@ function Get-SbAll {
     return $out.ToArray()
 }
 
-$filter = "fact_opportunity?select=activity_id,prospect_id&order=activity_id"
-if ($OnlyMissing) { $filter = "fact_opportunity?select=activity_id,prospect_id&details_loaded_at=is.null&order=activity_id" }
+# created_at_utc comes along for the ride and is written back UNCHANGED.
+#
+# PostgREST's merge-duplicates upsert is an INSERT ... ON CONFLICT DO UPDATE, so the payload
+# has to satisfy every NOT NULL column even though every row already exists - omitting it
+# fails with 23502. Carrying the warehouse's own value through is safer than re-deriving it
+# from the detail response: that would re-parse an LSQ timestamp for no benefit, and a
+# timezone slip there would silently move every deal's creation date.
+$filter = "fact_opportunity?select=activity_id,prospect_id,created_at_utc&order=activity_id"
+if ($OnlyMissing) { $filter = "fact_opportunity?select=activity_id,prospect_id,created_at_utc&details_loaded_at=is.null&order=activity_id" }
 $todo = Get-SbAll $filter
 if ($Limit -gt 0 -and $todo.Count -gt $Limit) { $todo = $todo[0..($Limit-1)] }
 Write-LsqLog "Opportunities to load: $($todo.Count)" $logPath
@@ -129,7 +136,8 @@ function ConvertTo-SbValue {
 # ---------------------------------------------------------------------------------------
 # Pull and upsert, in batches.
 # ---------------------------------------------------------------------------------------
-$cols = @('activity_id','prospect_id','details_loaded_at','opportunity_id','opportunity_note') +
+$cols = @('activity_id','prospect_id','created_at_utc','details_loaded_at',
+          'opportunity_id','opportunity_note') +
         ($Map | ForEach-Object { $_.Col })
 $cols = $cols | Select-Object -Unique
 
@@ -183,11 +191,17 @@ foreach ($t in $todo) {
     $row = @{
         activity_id       = $oppId
         prospect_id       = "$($resp.RelatedProspectId)"
+        created_at_utc    = $t.created_at_utc      # written back unchanged - see above
         opportunity_id    = $oppId
         opportunity_note  = "$($resp.OpportunityNote)"
         details_loaded_at = ([datetime]::UtcNow).ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
     }
     if (-not $row.prospect_id) { $row.prospect_id = "$($t.prospect_id)" }
+    if (-not $row.created_at_utc) {
+        # Only possible if the row vanished between the SELECT and here. Skip rather than
+        # invent a creation date that would then look authoritative.
+        $failed++; continue
+    }
 
     foreach ($m in $Map) {
         $f = $fields[$m.Schema]
