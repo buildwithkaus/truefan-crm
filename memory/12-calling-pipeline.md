@@ -103,29 +103,53 @@ but it is a **floor, not the truth**: a rep calls a lead at 10:00, Callkaro touc
 When a QC number disagrees with the pipeline, check the QC scope before assuming the pipeline
 is wrong.
 
-## The Opportunity object has no deal-value and no close-date field (2026-08-09)
+## The forecast fields exist and are unused (2026-08-09)
 
-Enumerated live across 23 real opportunities via
-`OpportunityManagement.svc/GetOpportunitiesOfLead` — 66 properties, of which exactly **four**
-are custom fields:
+**An earlier version of this note said the deal-value and closure-date fields did not exist on
+this account. That was wrong, and the error is worth keeping.**
 
-| Field | Holds | Filled |
+`GetOpportunitiesOfLead` returned `mx_Custom_6` and `mx_Custom_8` present, empty, and with **no
+display name in the payload**. I read "unlabelled and empty on every record" as "placeholder
+that was never configured" and concluded the fields were absent. They are in fact:
+
+| Schema | Display name | Type |
 |---|---|---|
-| `mx_Custom_1` | Deal name | 23 / 23 |
-| `mx_Custom_2` | Deal stage | 23 / 23 |
-| `mx_Custom_6` | *nothing, no display name* | 0 / 23 |
-| `mx_Custom_8` | *nothing, no display name* | 0 / 23 |
+| `mx_Custom_6` | **Expected Deal Size** | Number |
+| `mx_Custom_7` | **Actual Deal Size** | Number |
+| `mx_Custom_8` | **Expected Closure Date** | DateTime |
+| `mx_Custom_9` | **Actual Closure Date** | DateTime |
 
-**There is no deal-value field and no expected-closure-date field. Not blank — absent.**
+The Opportunity object has **17 custom fields**, including Loss Reason, Product, Celebrity
+Assigned, Contract Start/End and Agreement/Invoice Sent Date. The forecast was designed for and
+never adopted.
 
-This reframes the forecast gap completely. It had been understood as reps not filling the
-fields in, which is a coaching problem; it is actually a missing field, which is a five-minute
-admin task. Chasing reps for it would have been chasing them for something impossible.
+**The lesson: the API returns schema names only. An unlabelled field in a payload is not a
+missing field — the display names live in the form designer, which the API never exposes
+(gotcha 23: no field-metadata endpoint answers).** Read the form designer before concluding a
+field does not exist. This is the same family as gotcha 2 — a plausible-looking negative that
+nobody verified.
 
-The warehouse columns (`fact_opportunity.deal_value`, `expected_close_date`) and every
-forecast view are already written against them, so once the LSQ fields exist this is a mapping
-line in the ingest — not a schema change plus a re-ingest, which for opportunities costs one
-API call per lead.
+### What is actually true, measured across 107 opportunities in all four deal buckets
+
+| Field | Returned by the API | Filled |
+|---|---|---|
+| Expected Deal Size (`_6`) | yes, on all 107 | **0** |
+| Expected Closure Date (`_8`) | yes, on all 107 | **3** (all at In Discussion) |
+| Actual Deal Size (`_7`) | **never returned** | cannot be read |
+| Actual Closure Date (`_9`) | **never returned** | cannot be read |
+
+Two separate problems, and they need different fixes. The expected fields are a **process gap**
+— they are readable and nobody fills them, including on the 150 deals already marked Won. The
+actual fields are a **visibility gap** — even once a rep fills them, no report can read them.
+
+Only 4 of the 17 configured fields come back (`_1`, `_2`, `_6`, `_8`, plus `Status`), and the
+set is identical on every record, so it is not value-driven. Working hypothesis: the response
+mirrors the opportunity grid/list-view configuration. Untested — the test is to add Actual Deal
+Size to that view and re-run `07-probe-opportunity-population.ps1`.
+
+**The activity trail is worse still**: EventCode 12000 carries only `mx_Custom_1`, `_2`,
+`Status` and `Owner`. Anything forecast-related has to come from the opportunity read, which is
+a second API call per lead on top of the trail.
 
 Two smaller findings from the same probe:
 

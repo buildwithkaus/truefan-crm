@@ -211,18 +211,25 @@ rep's production count. Those appear as their own column instead.
 last call. The headline of the tab is not a forecast — it is *forecast coverage*, the share of
 open deals carrying both fields.
 
-**Today that share is zero, and not because reps have not filled the fields in.** Enumerated
-live on 2026-08-09 across 23 real opportunities: the Opportunity object has 66 properties and
-**four** custom fields — `mx_Custom_1` (deal name), `mx_Custom_2` (deal stage), and
-`mx_Custom_6` / `mx_Custom_8`, both empty on every deal and carrying no display name.
+**Today that share is zero, and the fields exist.** Measured 2026-08-09 across 107 real
+opportunities sampled from all four deal buckets:
 
-> **There is no deal-value field and no expected-closure-date field. Absent, not blank.**
+| Field | Schema | Returned by the API | Filled |
+|---|---|---|---|
+| Expected Deal Size | `mx_Custom_6` | yes | **0 / 107** |
+| Expected Closure Date | `mx_Custom_8` | yes | **3 / 107** |
+| Actual Deal Size | `mx_Custom_7` | **no** | cannot be read |
+| Actual Closure Date | `mx_Custom_9` | **no** | cannot be read |
 
-Nobody can fill in a field that has not been created, so this is a five-minute admin task on
-the LSQ Opportunity object, not a coaching problem. The tab says exactly that, in those terms,
-rather than showing a sea of blanks that reads like rep negligence. The warehouse columns and
-every forecast view are already written against them — creating the fields makes this work with
-no further code change.
+Two different problems. The *expected* fields are a **process gap** — readable, and empty on
+every deal including the 150 already marked Won. The *actual* fields are a **visibility gap** —
+configured in the form designer but never returned by `GetOpportunitiesOfLead`, so a rep can
+fill them and no report can read them.
+
+> An earlier version of this document claimed these fields did not exist. The API returns
+> schema names with no display names, and only 4 of the 17 configured custom fields come back
+> at all — so "unlabelled and empty" was misread as "absent". Check the form designer before
+> concluding a field is missing. See gotcha 24.
 
 Once values do exist, `Est. value we cannot see` prices the unvalued deals at each rep's own
 average deal size. It is **the size of the blind spot, not a prediction**, and is labelled that

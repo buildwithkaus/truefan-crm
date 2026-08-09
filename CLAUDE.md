@@ -154,10 +154,19 @@ new script. One line each:
     field-metadata endpoint exists** (14 candidates probed; only `GetOpportunityTypes`
     answers, and its `Fields` is null) — the only way to learn the opportunity schema is to
     read a real opportunity.
-24. **The Opportunity object carries only four custom fields** on this account:
-    `mx_Custom_1` (deal name), `mx_Custom_2` (deal stage), and `mx_Custom_6`/`mx_Custom_8`,
-    both empty and unnamed. **There is no deal-value or expected-close-date field** — absent,
-    not blank. Any forecast work starts with creating them in the LSQ UI.
+24. **The opportunity API returns SCHEMA names with no display names, and only a subset of the
+    fields that exist.** The Opportunity object has **17 custom fields** in the LSQ form
+    designer (`mx_Custom_6` Expected Deal Size, `_7` Actual Deal Size, `_8` Expected Closure
+    Date, `_9` Actual Closure Date, `_4` Loss Reason, `_16`/`_17` Agreement/Invoice Sent Date,
+    …), but `GetOpportunitiesOfLead` returns only `mx_Custom_1`, `_2`, `_6`, `_8` and `Status`.
+    **An unlabelled, empty field in the payload is not a missing field** — reading it that way
+    produced a confident, wrong "there is no deal-value field" on 2026-08-09. Check the form
+    designer before concluding a field does not exist. `_7`/`_9` currently cannot be read at
+    all; suspected to be the grid/list-view configuration, untested.
+25. **The opportunity activity trail carries fewer fields than the opportunity read.** EventCode
+    12000 on `ProspectActivity.svc/Retrieve` has only `mx_Custom_1`, `_2`, `Status`, `Owner` —
+    no deal size, no dates. Anything forecast-related must come from
+    `OpportunityManagement.svc/GetOpportunitiesOfLead`, which is a second call per lead.
 
 Plus: **no bulk Opportunity read endpoint and no bulk Activity read endpoint exist** — both cost
 one API call per lead, so always narrow to a candidate set first. **No Notes API exists** either.
