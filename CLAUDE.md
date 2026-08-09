@@ -163,10 +163,35 @@ new script. One line each:
     produced a confident, wrong "there is no deal-value field" on 2026-08-09. Check the form
     designer before concluding a field does not exist. `_7`/`_9` currently cannot be read at
     all; suspected to be the grid/list-view configuration, untested.
-25. **The opportunity activity trail carries fewer fields than the opportunity read.** EventCode
-    12000 on `ProspectActivity.svc/Retrieve` has only `mx_Custom_1`, `_2`, `Status`, `Owner` —
-    no deal size, no dates. Anything forecast-related must come from
-    `OpportunityManagement.svc/GetOpportunitiesOfLead`, which is a second call per lead.
+25. **Three ways to read an opportunity, each returning a different subset.** The activity
+    trail (EventCode 12000) has only `mx_Custom_1`, `_2`, `Status`, `Owner`.
+    `GetOpportunitiesOfLead` adds `_6`/`_8`. **`GetOpportunityDetails?opportunityId=X` (a GET)
+    returns all 29 fields with `DisplayName` and `DataType`** — it is also the field-metadata
+    endpoint gotcha 24 says does not exist, because it was not among the 14 names probed. The
+    `opportunityId` is the same GUID as the activity `Id`, so no lookup pass is needed.
+26. **`Requirement Gathering` means different things on the Contact and the Opportunity.** On
+    the **Opportunity** it is a real, current stage — the *warm* pipeline. On the **Contact**
+    it is legacy and maps to `Prospect`. `schema.ps1`'s `OpportunityStageRenames` refers to
+    the Contact. Treating the opportunity value as drift flagged a healthy warm pipeline as a
+    data-quality failure.
+27. **Apps Script's UrlFetch quota is shared across EVERY trigger, function and webhook
+    execution in the project**, and blowing it fails the *last* thing to run rather than the
+    thing that spent it — so the symptom appears on innocent code. A job that fetched
+    per-record on a 10-minute trigger spent ~29,000 calls/day on its own and silently killed
+    the dashboard for a full day. Batch reads server-side (one RPC returning a JSON bundle,
+    not N REST calls), bound every per-record loop, and **meter the spend** — `ufFetch_`
+    counts, `ufSpentToday_` reports, and enrichment yields to reporting under pressure.
+28. **`dim_rep` was created in migration 001 and never populated.** Most views coalesce
+    through `dim_contact` and looked fine, so an empty join table survived a week; it only
+    surfaced as a raw GUID appearing where a rep name belonged. Anything created empty and
+    filled "later" needs the filling wired into a job that already runs.
+29. **Apps Script concatenates every `.gs` in a project into ONE global scope; the last
+    definition of a name wins**, with no module system and no warning. `WebhookCapture.gs`
+    and `CallingPipeline.gs` both define `doPost`/`ok_`; the archived `SheetsSync.gs` collides
+    with nine more including `TABS` and `writeTable_`. If the wrong one loads last, live
+    webhooks land in a capture sheet and never reach Supabase — and LeadSquared still gets its
+    200, so nothing reports an error. **See `appsscript/README.md` for which file belongs in
+    which project.**
 
 Plus: **no bulk Opportunity read endpoint and no bulk Activity read endpoint exist** — both cost
 one API call per lead, so always narrow to a candidate set first. **No Notes API exists** either.

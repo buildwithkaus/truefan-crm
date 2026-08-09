@@ -139,8 +139,18 @@ Callkaro-only (52%)**, 7,675 to pull, two nights at a 4,000-call ceiling.
 
 ## 5. Sheet tabs
 
+Every tab renders from **one bundled read**. `refreshReports()` calls `report_bundle()` once
+and slices the result; only Forecast and Exceptions fetch separately, because they are large
+enough that folding them in would make a single payload unwieldy. Three UrlFetch calls per
+refresh, against ~14 before — see §8.
+
 Tabs are ordered and colour-coded on every refresh by `orderTabs_()`: blue = calling
 activity, green = the book and the funnel, red = things to fix, amber = QC, grey = plumbing.
+Rep-facing tabs carry a **Team** column with per-team banding and a filter on the header.
+
+> Teams are a **column, not header rows**. Sheets treats an inserted group header as data, so
+> sorting or filtering scatters them — and a filter on every table was an explicit
+> requirement. Colour gives the grouping; the column keeps it filterable.
 
 | Tab | Contents |
 |---|---|
@@ -148,7 +158,8 @@ activity, green = the book and the funnel, red = things to fix, amber = QC, grey
 | **Rep Day** | Per rep per day, 7 days |
 | **Daily Trend** | Whole-team totals by day — the month view |
 | **Pipeline State** | What each rep *holds*, from the daily book snapshot |
-| **Rep Funnel** | Book → Engaged → Prospect → Opportunity → Won/Lost, one row per rep |
+| **Teams** | The org chart, and the same numbers rolled up to team level |
+| **Rep Funnel** | THE BOOK ∥ THE WORK (30d) ∥ THE DEAL BOOK, one row per rep |
 | **Prospects Daily** | Matrix: days down, reps across. The production number |
 | **Stage Movement** | Every stage transition; calls measure effort, this measures progress |
 | **Deal Board** | Per-rep deal book, plus open deals by stage |
@@ -354,7 +365,48 @@ Standing checks: `Meta` not red · `Pending` and `Unparsed` empty · QC shows ze
 
 ---
 
-## 7. Known gaps
+## 8. The UrlFetch budget
+
+**Apps Script's UrlFetch quota is per PROJECT per day, shared across every trigger, function
+and webhook execution.** Exceeding it fails whatever runs *last*, not whatever spent it — so
+the error surfaces on innocent code and reads like a bug. On 2026-08-09 it killed Pipeline
+State, Exceptions and QC for a whole day with `Service invoked too many times for one day:
+premium urlfetch`, and a full `diagnose()` was needed to establish that nothing was broken.
+
+Where it went, in the old design:
+
+| Job | Cadence | Per run | Per day |
+|---|---|---|---|
+| `enrichLeads` | 10 min | 2 reads + up to 200 lead fetches + 1 upsert | **~29,200** |
+| Webhook ingest | continuous | 1 per batch | ~3,600 |
+| `refreshReports` | 10 min | ~14 reads | ~2,000 |
+| `flushPending` | 5 min | ~1 | ~290 |
+
+`enrichLeads` was 83% of it, and its worst branch was the one that ran when there was
+**nothing to do**: with the backlog clear it re-fetched 200 of today's contacts every run,
+with no staleness test.
+
+What holds it down now:
+
+- **One RPC, not N REST calls.** `report_bundle()` returns every small and medium dataset in
+  a single ~230 KB response.
+- **Postgres does the set difference.** `v_calls_awaiting_enrichment` replaces pulling
+  `fact_call` and all of `dim_contact` into Apps Script memory to diff them there.
+- **The idle branch requires staleness** — 2 hours minimum, capped at 40 contacts.
+- **Every fetch is metered.** `ufFetch_` counts, the total is flushed once per execution, and
+  Meta plus `diagnose()` show it.
+- **Enrichment yields to reporting.** Above `UF_ENRICH_CEILING` (8,000/day) enrichment stops
+  and logs that it did. A rep name arriving an hour late is cosmetic; a dashboard that
+  silently stops refreshing is what cost a day.
+
+Steady state is now roughly 1,000–5,000/day.
+
+**The quota does not refund.** Once spent, nothing refreshes until it resets at midnight in
+the script's timezone — no code change helps that day.
+
+---
+
+## 9. Known gaps
 
 1. **Notes are still not captured.** `CallNotes` was empty on every payload examined,
    confirming `memory/11`. The column exists and fills the day capture is switched on. The

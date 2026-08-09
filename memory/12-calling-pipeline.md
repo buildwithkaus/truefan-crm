@@ -290,6 +290,73 @@ So the honest count of genuine forecast data in the entire deal book is **one re
 today, as a test**. The field-level fix (mandatory at In Discussion) has to come with
 validation, or the column fills with 4s.
 
+## The day the dashboard died: an Apps Script quota, not a bug (2026-08-09)
+
+`refreshReports()` failed with `Service invoked too many times for one day: premium urlfetch`
+and stayed broken for the rest of the day. Pipeline State, Exceptions and QC were blank; the
+earlier tabs looked fine.
+
+**The quota is per PROJECT per day, shared across every trigger, function and webhook
+execution — and it fails whatever runs LAST, not whatever spent it.** So the error appears on
+innocent code, in a different function from the cause, hours after the spending happened.
+That is a genuinely hard signal to read, and it took a `diagnose()` that called the bundle
+directly to establish that nothing was actually broken.
+
+`enrichLeads` was 83% of the spend (~29,200/day), and its worst branch was the one that ran
+when there was **nothing to do**: with the enrichment backlog clear it re-fetched 200 of
+today's contacts every ten minutes, with no staleness test. An idle loop, running flat out.
+
+Fixes, in order of how much they matter:
+
+1. **Meter it.** Every fetch goes through `ufFetch_`; the count is flushed once per execution
+   and shown on Meta and in `diagnose()`. Reasoning about the spend is what failed - the
+   previous version was also "bounded by construction".
+2. **Enrichment yields to reporting** above 8,000 calls/day. The job that can wait is the one
+   that gets cut off; the one people are watching survives.
+3. **One RPC instead of fourteen REST calls.** `report_bundle()` returns every dataset in a
+   single ~230 KB, 3.6s response.
+4. **Postgres does the set difference** (`v_calls_awaiting_enrichment`) rather than Apps
+   Script pulling both tables in to diff them.
+
+The quota does not refund. Once spent, nothing refreshes until midnight in the script's
+timezone, and no code change helps that day.
+
+### Two smaller things the same session turned up
+
+**`dim_rep` had been empty since migration 001.** Nothing ever wrote to it. Most views coalesce
+through `dim_contact` and looked fine, so it survived a week; it only surfaced as a raw GUID
+appearing where a rep name belonged on the new Rep Funnel. Populated from `dim_contact` (22
+owners) and now maintained by the book snapshot, which already sees every owner. **Anything
+created empty and filled "later" needs the filling wired into a job that already runs.**
+
+**A count formatted as a date.** `colType_` tested `indexOf('date') >= 0`, which matches
+`contacts_upDATEd` - so a count of 14 rendered as 14 January 1900. Sheets was right: 14 is day
+14 of the epoch. Suffix matching now, with a value-shape fallback. `'rate'` had the identical
+problem. Substring matching on column names is a trap.
+
+## Where the numbers stood at end of session (2026-08-09)
+
+| | |
+|---|---|
+| Calls, 1-8 Aug | 12,907 dials, 4,500 connects (34.9%) |
+| Book | 91,003 contacts; 26,375 workable |
+| Deal book | 1,398 deals - 49 hot, 91 warm, 979 new, 150 won |
+| Forecast fields filled | Expected Deal Size **2**, Expected Closure Date **7**, Actual **0** |
+| Oracle reconciliation, 7 Aug | 2,249 vs 2,249, all 15 reps exact |
+| QC | 9 PASS, 1 INFO, 3 GAP, 1 FAIL |
+
+The single FAIL is 3,053 contacts on a non-canonical **contact** stage. The GAPs are forecast
+adoption, correctly reported as business gaps rather than pipeline defects.
+
+**Disposition dropdown drift**, found while building the trend tab - four values in use that
+are not selectable options, so reps can set them but cannot filter on them:
+`Not Interested - No Reason Gauged` 55 · `Requirement Gathering (Warm)` 12 ·
+`Not Interested - Wrong Contact` 4 · `Reached Voicemail` 2. The second is a *contact stage*
+sitting in the *disposition* field, across five reps.
+
+**The Unassigned bucket is larger than either team**: Admin 21,341 and Shriyanka Gupta 9,235,
+35,811 in total, against Team #ONE 31,828 and Team Achievers 23,364.
+
 ## Still open
 
 - **Notes remain uncaptured** — `CallNotes` empty on every payload, confirming

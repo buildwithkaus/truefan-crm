@@ -1,13 +1,16 @@
 # Project Plan — TrueFan CRM Pipeline & Funnel Fix
 
-Status as of 2026-08-08. Read `CLAUDE.md` first for orientation and the hard rules, and
+Status as of 2026-08-09. Read `CLAUDE.md` first for orientation and the hard rules, and
 `docs/LSQ_API_GOTCHAS.md` for the API failure modes that apply to every phase below.
 
 **Where the project actually is:** the data-model work (Phases 1-5R) is done and reconciled.
-The live work is now Phase 9 — running the ICP assignment programme and holding reps to
-recording what they do — plus Phase 10, the real-time calling pipeline, which is built and
-awaiting deploy. Phases 6 (automation) and 7 (training) remain open and are what would make
-Phase 9's findings self-correcting rather than something a report has to catch.
+Phase 10 — the real-time calling pipeline — is **live and reconciling exactly** against an
+independent recount, and now covers the deal funnel end to end (10b, 10c). The live work is
+Phase 9, running the ICP assignment programme, plus three things Phase 10 surfaced that are
+business decisions rather than engineering: making the forecast fields mandatory *with
+validation*, clearing the CRM hygiene backlog, and deciding what happens to the 35,811
+contacts nobody owns. Phases 6 (automation) and 7 (training) remain open and are what would
+make Phase 9's findings self-correcting rather than something a report has to catch.
 
 ## Phase 0 — Foundation (done before this repo existed)
 
@@ -439,7 +442,7 @@ rather than approximated. **The pipeline never writes to LSQ.**
 
 **Built and verified:** 6 Supabase migrations; `CallingPipeline.gs` (ingest, enrichment,
 reporting, 6 hygiene flags, pivot); 4 PowerShell tools (webhook management, QC, backfill,
-oracle); **44 tests passing against real captured payloads**. `scripts/lib/activity.ps1`
+oracle); **57 tests passing against real captured payloads**. `scripts/lib/activity.ps1`
 consolidates the per-lead block that was copy-pasted six times, two copies missing retry.
 
 **Gotchas 14–20 in `CLAUDE.md`** all came from this build. The expensive ones: millisecond
@@ -490,9 +493,45 @@ real per-call disposition over the 12-hour inference. Adding a nullable column t
 8,000-row table is instant; retrofitting after 200,000 rows, with a re-ingest costing one API
 call per lead, is not.
 
+### 10c — Teams, the bundled read, and the deal book loaded (2026-08-09)
+
+Migrations `013`; tabs **Teams** plus a rebuilt **Rep Funnel**. Twelve commits.
+
+**The deal book is fully loaded.** All 1,398 opportunities read through
+`GetOpportunityDetails`, 0 failures. Deduped per contact the open book is **49 hot, 91 warm,
+979 new, 150 won** — 4% of open deals have progressed past a first conversation, and 888 of
+the 979 were created across four days in late July by the backfill and migration rather than
+by a rep. That number needed no new field and reframes the pipeline more than deal size does.
+
+**Forecast fields exist and are unused**, correcting an earlier wrong finding of mine: across
+all 1,398 deals, Expected Deal Size is filled on **2** and Expected Closure Date on **7**.
+Neither survives inspection — one is a test record, the other carries a deal value of `4`.
+**Do not make the field mandatory without validation**, or the column fills with 4s.
+
+**`Requirement Gathering` is a real warm stage on the Opportunity** and legacy only on the
+Contact. Same string, two objects, opposite meanings; 012 had flagged a healthy warm pipeline
+as drift.
+
+**The dashboard died for a day on an Apps Script quota**, not a bug — `enrichLeads` was
+spending ~29,200 UrlFetch calls/day, 83% of the project total, and its worst branch ran when
+there was nothing to do. Now metered (`ufFetch_`), bundled into one RPC, and enrichment yields
+to reporting under pressure. `docs/CALLING_PIPELINE.md` §8 has the full accounting.
+
+**`dim_rep` had been empty since migration 001** — nothing ever populated it. Now filled and
+maintained by the book snapshot.
+
 **Still open:**
-- **Deal value and expected closure date must be created on the LSQ Opportunity object.**
-  Nothing else blocks the forecast.
+- **Expected Deal Size / Expected Closure Date need to be made mandatory at In Discussion,
+  with validation.** Nothing else blocks the forecast.
+- **Actual Deal Size and Actual Closure Date are invisible to `GetOpportunitiesOfLead`** —
+  readable only via `GetOpportunityDetails`. Adding them to the grid view did not help.
+- **Disposition dropdown drift** — four non-canonical values in use across 73 calls, one of
+  them a contact stage.
+- **The Unassigned bucket is larger than either team** — Admin 21,341, Shriyanka Gupta 9,235.
+- Hygiene backlog: 47 open deals on disqualified contacts (close as Lost, rule confirmed), 84
+  Prospects with no deal, 129 duplicate pairs (being fixed by hand).
+- Client list awaited, to reconcile 150 Won deals against 190 Customer-stage contacts and
+  seed Actual Deal Size for closed business.
 - **Notes remain uncaptured** — reports the *what*, not the *why*. EventCode 203 is no longer
   dead (last activity on 806 leads), making its fields mandatory the cheapest route.
 - 281 field-change events captured before the handler existed sit unimported in `Unparsed`.
