@@ -182,6 +182,28 @@ foreach ($k in $tally.Keys) {
 $all = $rows.ToArray()
 $headers = @{ apikey = $sbKey; Authorization = "Bearer $sbKey"
               Prefer = "resolution=merge-duplicates,return=minimal" }
+
+# ---------------------------------------------------------------------------------------
+# Clear this date FIRST. The primary key is (snapshot_date, owner_id, contact_stage), so an
+# upsert only ever adds or updates - it cannot remove a bucket that has emptied since the
+# last run on the same date.
+#
+# Found the expensive way on 2026-08-11: a stage reconciliation cleared 3,558 contacts off
+# legacy stages, this script was re-run, and the tab still showed 'Fresh Lead 208' and
+# 'Wrong Number 44' - the untouched rows from the morning's run. Live LSQ had ZERO of both.
+# It reads exactly like a failed migration, and it cost a round of investigating a fix that
+# had actually worked.
+#
+# A same-day re-run is normal (after a reconciliation, or a second pass), so this is not an
+# edge case. Delete-then-insert per date, not upsert.
+# ---------------------------------------------------------------------------------------
+foreach ($tbl in @("fact_book_snapshot", "fact_disqualification_snapshot")) {
+    [void](Invoke-LsqWithRetry -What "clear $tbl for $SnapshotDate" -Action {
+        Invoke-RestMethod -Uri "$sbUrl/rest/v1/$tbl`?snapshot_date=eq.$SnapshotDate" -Method Delete `
+            -Headers @{ apikey = $sbKey; Authorization = "Bearer $sbKey" } -ErrorAction Stop
+    })
+}
+Write-LsqLog "Cleared any existing rows for $SnapshotDate before writing." $logPath
 $written = 0
 for ($i = 0; $i -lt $all.Count; $i += 500) {
     $slice = $all[$i..([Math]::Min($i + 499, $all.Count - 1))]
