@@ -168,6 +168,17 @@ if ($WhatIfPreference) {
 
 Save-Buffer
 Write-LsqLog "Wrote $written rows to dim_contact_book." $logPath
+
+# Refresh the ICP snapshot built on top of this table. CONCURRENTLY so the tabs keep serving
+# while it rebuilds - without it the refresh takes the ICP tab offline for its duration,
+# which is trading one outage for another. Left stale it would silently describe an older
+# book, so v_qc_icp compares its row count against dim_contact_book.
+[void](Invoke-LsqWithRetry -What "refresh mv_icp_contact" -Action {
+    Invoke-RestMethod -Uri "$sbUrl/rest/v1/rpc/refresh_icp_snapshot" -Method Post `
+        -Body "{}" -Headers @{ apikey = $sbKey; Authorization = "Bearer $sbKey" } `
+        -ContentType "application/json" -ErrorAction Stop
+})
+Write-LsqLog "Refreshed mv_icp_contact." $logPath
 Write-LsqLog "" $logPath
 Write-LsqLog "VERIFY INDEPENDENTLY - a write response is not evidence:" $logPath
 Write-LsqLog "  GET /rest/v1/v_qc_icp?select=*" $logPath

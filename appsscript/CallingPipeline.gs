@@ -72,7 +72,7 @@ var TAB_COLOR = {
 // Bumped on every code change. diagnose() and the Meta tab both print it, which is the only
 // reliable way to tell "my paste did not take effect" apart from "the code ran and did
 // nothing" - two failures that look identical from the Sheet.
-var CODE_VERSION = '2026-08-11.4-bundle-diag';
+var CODE_VERSION = '2026-08-11.5-split-bundle';
 
 var IST_OFFSET_MS = 330 * 60 * 1000;
 
@@ -386,6 +386,19 @@ function sbChannelBundle_(fromDate) {
   return JSON.parse(res.getContentText());
 }
 
+function sbIcpBundle_(fromDate) {
+  var url = cfg_('SUPABASE_URL').replace(/\/+$/, '') + '/rest/v1/rpc/icp_bundle';
+  var res = ufFetch_(url, {
+    method: 'post', contentType: 'application/json',
+    headers: { apikey: cfg_('SUPABASE_SERVICE_KEY'),
+               Authorization: 'Bearer ' + cfg_('SUPABASE_SERVICE_KEY') },
+    payload: JSON.stringify({ p_from: fromDate || HISTORY_FROM }),
+    muteHttpExceptions: true
+  });
+  var code = res.getResponseCode();
+  if (code >= 300) { throw new Error('icp_bundle HTTP ' + code + ': ' + res.getContentText().slice(0, 400)); }
+  return JSON.parse(res.getContentText());
+}
 function sbBundle_(fromDate) {
   var url = cfg_('SUPABASE_URL').replace(/\/+$/, '') + '/rest/v1/rpc/report_bundle';
   var res = ufFetch_(url, {
@@ -845,6 +858,18 @@ function refreshReports() {
       fetches++;
       var merged = 0;
       for (var ck in C) { if (C.hasOwnProperty(ck)) { B[ck] = C[ck]; merged++; } }
+
+      // The ICP and disqualification datasets live in a SECOND function. Splitting them was
+      // not tidiness: every view is individually fast, but as ONE statement they exceeded the
+      // statement timeout and the whole bundle 500'd, blanking four tabs at once. Fetched
+      // separately so a slow half cannot take the other half down with it.
+      try {
+        var D = sbIcpBundle_(HISTORY_FROM);
+        fetches++;
+        for (var dk in D) { if (D.hasOwnProperty(dk)) { B[dk] = D[dk]; merged++; } }
+      } catch (eI) {
+        failures.push('icp_bundle (migration 028 applied?): ' + eI);
+      }
 
       // Report what arrived, not just that the call returned 200. An empty tab has two very
       // different causes - the fetch failed, or it succeeded and the dataset is genuinely
