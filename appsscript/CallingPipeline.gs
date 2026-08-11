@@ -45,6 +45,10 @@ var TABS = {
   PROSPECTS: 'Prospects Daily',
   FUNNEL: 'Stage Movement',
   DEALS: 'Deal Board',
+  CHANNELS: 'Channels',
+  BOOK_HEALTH: 'Book Health',
+  DISQUALIFIED: 'Disqualified',
+  ICP: 'ICP',
   FORECAST: 'Forecast',
   EXCEPTIONS: 'Exceptions',
   QC: 'QC',
@@ -68,7 +72,7 @@ var TAB_COLOR = {
 // Bumped on every code change. diagnose() and the Meta tab both print it, which is the only
 // reliable way to tell "my paste did not take effect" apart from "the code ran and did
 // nothing" - two failures that look identical from the Sheet.
-var CODE_VERSION = '2026-08-09.5-budget-guard';
+var CODE_VERSION = '2026-08-11.4-bundle-diag';
 
 var IST_OFFSET_MS = 330 * 60 * 1000;
 
@@ -213,6 +217,28 @@ function diagnose() {
     Logger.log('Supabase READ ok - ref_canonical_value returned ' + rows.length + ' row(s)');
   } catch (e) { Logger.log('Supabase READ FAILED: ' + e); return; }
 
+  // Channel ingest health. Reported here because "the webhooks are live" and "the receiver
+  // stores what they send" are two different things, and the gap between them looks like
+  // nothing at all: the old handler drops every non-call activity and still returns 200, so
+  // LSQ never marks a failure and no error surfaces anywhere.
+  try {
+    var chan = sbSelect_('v_qc_channel', 'select=check_name,status,expected,actual', 10);
+    for (var c = 0; c < chan.length; c++) {
+      Logger.log('  channel QC [' + chan[c].status + '] ' + chan[c].check_name +
+                 ' - expected ' + chan[c].expected + ', actual ' + chan[c].actual);
+    }
+    var unmapped = sbSelect_('v_channel_unmapped', 'select=event_code,event_name,touches&order=touches.desc&limit=5', 5);
+    if (unmapped.length) {
+      for (var m = 0; m < unmapped.length; m++) {
+        Logger.log('  UNMAPPED channel: ' + unmapped[m].event_code + ' ' +
+                   unmapped[m].event_name + ' x' + unmapped[m].touches +
+                   ' - add it to ref_channel');
+      }
+    }
+  } catch (e5) {
+    Logger.log('Channel views not reachable (migration 015 applied?): ' + e5);
+  }
+
   try {
     var health = sbSelect_('v_pipeline_health', 'select=*', 1)[0];
     Logger.log('v_pipeline_health: calls_stored=' + health.calls_stored +
@@ -334,6 +360,32 @@ function sbUpsert_(table, rows) {
  * (Forecast, Exceptions) stay separate so no single payload gets unwieldy - three calls per
  * refresh instead of fourteen.
  */
+/**
+ * The second bundle: rep ordering, channel activity, book health and the newer QC families.
+ *
+ * Separate from report_bundle rather than merged into it because merging meant rewriting a
+ * 60-line SQL function in full, and a slip there breaks every existing tab at once. The cost
+ * is one extra UrlFetch per refresh - 48 a day against a 20,000 quota.
+ */
+function sbChannelBundle_(fromDate) {
+  var url = cfg_('SUPABASE_URL').replace(/\/+$/, '') + '/rest/v1/rpc/channel_bundle';
+  var res = ufFetch_(url, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      apikey: cfg_('SUPABASE_SERVICE_KEY'),
+      Authorization: 'Bearer ' + cfg_('SUPABASE_SERVICE_KEY')
+    },
+    payload: JSON.stringify({ p_from: fromDate || HISTORY_FROM }),
+    muteHttpExceptions: true
+  });
+  var code = res.getResponseCode();
+  if (code >= 300) {
+    throw new Error('channel_bundle HTTP ' + code + ': ' + res.getContentText().slice(0, 400));
+  }
+  return JSON.parse(res.getContentText());
+}
+
 function sbBundle_(fromDate) {
   var url = cfg_('SUPABASE_URL').replace(/\/+$/, '') + '/rest/v1/rpc/report_bundle';
   var res = ufFetch_(url, {
@@ -406,7 +458,7 @@ function handle_(e) {
     var items = JSON.parse(raw);
     if (!Array.isArray(items)) items = [items];
 
-    var calls = [], outcomes = [], fieldChanges = [], unknown = 0;
+    var calls = [], outcomes = [], touches = [], fieldChanges = [], unknown = 0;
     for (var i = 0; i < items.length; i++) {
       var it = items[i];
       if (!it) continue;
@@ -422,8 +474,10 @@ function handle_(e) {
       if (!it.ProspectActivityId) { unknown++; continue; }
 
       var n = normalizeWebhookActivity_(it);
-      if (!n) continue;   // Callkaro or an out-of-scope activity code - intentionally dropped
-      if (n.kind === 'call') calls.push(n.row); else outcomes.push(n.row);
+      if (!n) continue;   // Callkaro, or an unparseable date - intentionally dropped
+      if (n.kind === 'call') calls.push(n.row);
+      else if (n.kind === 'touch') touches.push(n.row);
+      else outcomes.push(n.row);
     }
     if (unknown > 0) {
       ensureSheet_(TABS.UNPARSED, ['ReceivedIst', 'Reason', 'Raw']).appendRow([
@@ -436,11 +490,19 @@ function handle_(e) {
     try {
       sbUpsert_('fact_call', calls);
       sbUpsert_('fact_call_outcome', outcomes);
+      sbUpsert_('fact_touch', touches);
       sbUpsert_('fact_field_change', fieldChanges);
     } catch (dbErr) {
       // Supabase unavailable. Park the normalised rows and let flushPending retry: LSQ
       // gives up after 3 attempts, so anything dropped here is gone for good otherwise.
-      parkPending_(calls.concat(outcomes.map(function (o) { o.__outcome = true; return o; })));
+      // The marker keys are how flushPending routes each row back to its own table; without
+      // one, a parked touch would be replayed into fact_call and violate its event_code
+      // check constraint, taking the whole flush batch down with it.
+      parkPending_(
+        calls
+          .concat(outcomes.map(function (o) { o.__outcome = true; return o; }))
+          .concat(touches.map(function (t) { t.__touch = true; return t; }))
+      );
       return ok_('parked: ' + dbErr);
     }
     return ok_('');
@@ -522,19 +584,22 @@ function flushPending() {
   if (n <= 0) return;
 
   var vals = sh.getRange(2, 1, n, 3).getValues();
-  var calls = [], outcomes = [];
+  var calls = [], outcomes = [], touches = [];
   for (var i = 0; i < vals.length; i++) {
     try {
       var r = JSON.parse(vals[i][2]);
-      if (r.__outcome) { delete r.__outcome; outcomes.push(r); } else { calls.push(r); }
+      if (r.__outcome) { delete r.__outcome; outcomes.push(r); }
+      else if (r.__touch) { delete r.__touch; touches.push(r); }
+      else { calls.push(r); }
     } catch (e) { /* unparseable park row - dropped on the floor below */ }
   }
   try {
     sbUpsert_('fact_call', calls);
     sbUpsert_('fact_call_outcome', outcomes);
+    sbUpsert_('fact_touch', touches);
     // Only clear once the write has actually succeeded.
     sh.deleteRows(2, n);
-    Logger.log('flushPending: wrote ' + (calls.length + outcomes.length) + ' parked rows');
+    Logger.log('flushPending: wrote ' + (calls.length + outcomes.length + touches.length) + ' parked rows');
   } catch (err) {
     Logger.log('flushPending: still failing - ' + err);
   } finally {
@@ -578,7 +643,50 @@ function normalizeWebhookActivity_(item) {
     } };
   }
 
-  if (code !== EVT_CALL_OUT && code !== EVT_CALL_IN) return null;
+  // ---------------------------------------------------------------------------------
+  // Every OTHER activity type -> fact_touch. WhatsApp, chat, meetings, forms, contract,
+  // payment, and anything configured on the account later.
+  //
+  // This branch is deliberately GENERIC and deliberately last. It does not enumerate the
+  // channels it accepts, because the failure mode of a whitelist here is silence: an
+  // activity type nobody thought of gets dropped, and there is no bulk activity read to
+  // recover it from afterwards. Classification happens in SQL, against ref_channel, where
+  // an unrecognised code shows up in v_channel_unmapped as work to do.
+  //
+  // event_name is carried because EventCode 3011 is genuinely two different activities
+  // ("WhatsApp Message" and "Opportunity"), so the code alone cannot key the taxonomy.
+  // ---------------------------------------------------------------------------------
+  if (code !== EVT_CALL_OUT && code !== EVT_CALL_IN) {
+    // Opportunity events already have a home. The Opportunity_Post_Create/Update webhooks
+    // (29/30) deliver ActivityEvent=12000 with NO ActivityEventName and an EMPTY fields
+    // object, so they land here as content-free rows and then compete with fact_opportunity
+    // as a second, worse record of the same deal. Skipped deliberately - this is a known
+    // code with a better destination, NOT an unrecognised one being silently dropped.
+    if (code === '12000' || code === '33') return null;
+
+    // WhatsApp carries its own per-message direction in mx_Custom_2. No other channel does,
+    // so this is read only where it means that - reading it blindly would pick up Connected
+    // Outcome from 203 and Last Call Status from 209 and call them a direction.
+    var dirRaw = (code === '201' || code === '3011') ? String(d.mx_Custom_2 || '') : '';
+
+    return { kind: 'touch', row: {
+      activity_id: id,
+      prospect_id: lead,
+      event_code: code,
+      event_name: String(item.ActivityEventName || ''),
+      touched_at_utc: utc.toISOString(),
+      actor_owner_id: String(item.CreatedBy || d.Owner || '') || null,
+      actor_name: null,          // only phone payloads carry a caller name
+      status: String(d.Status || '') || null,
+      direction_raw: dirRaw || null,
+      duration_sec: null,
+      note: note || null,
+      // The whole fields object, unmodified. Channels differ too much to give each its own
+      // columns, and a new channel must not need an ALTER TABLE before its data can land.
+      attrs: d,
+      ingest_source: 'webhook'
+    } };
+  }
 
   // Duration from mx_Custom_3, with the note blob as a cross-check. A missing field must
   // not read as 0 seconds - that turns a connected call into an unconnected one and
@@ -728,6 +836,38 @@ function refreshReports() {
     var B = sbBundle_(HISTORY_FROM);
     fetches++;
 
+    // Second bundle: rep ordering, channels, book health, and the new QC families.
+    // Merged into B so every writer keeps taking a single object. Failure here must NOT
+    // take the refresh down - the tabs that predate it have to keep rendering, which is the
+    // same reason each tab below is individually try/caught.
+    try {
+      var C = sbChannelBundle_(HISTORY_FROM);
+      fetches++;
+      var merged = 0;
+      for (var ck in C) { if (C.hasOwnProperty(ck)) { B[ck] = C[ck]; merged++; } }
+
+      // Report what arrived, not just that the call returned 200. An empty tab has two very
+      // different causes - the fetch failed, or it succeeded and the dataset is genuinely
+      // empty - and they need opposite fixes. Without this line both look identical on the
+      // Sheet, which is exactly the "silence reads as zero" failure this project keeps
+      // hitting. The counts land on Meta.
+      var sizes = [];
+      var want = ['channel_day', 'book_health', 'icp_funnel', 'disq_by_rep', 'rep_order'];
+      for (var wi = 0; wi < want.length; wi++) {
+        var v = C[want[wi]];
+        sizes.push(want[wi] + '=' + (v === undefined ? 'ABSENT' : (v.length || 0)));
+      }
+      Logger.log('channel_bundle merged ' + merged + ' keys: ' + sizes.join(' '));
+      if (!C.channel_day || !C.channel_day.length) {
+        failures.push('channel_bundle returned no channel_day (' + sizes.join(' ') + ')');
+      }
+      if (C.icp_funnel === undefined) {
+        failures.push('channel_bundle has no icp_funnel key - migration 024 not applied');
+      }
+    } catch (e0) {
+      failures.push('channel_bundle FETCH FAILED (migrations 021/024 applied?): ' + e0);
+    }
+
     var tabs = [
       ['Dashboard',       function () { writeDashboard_(B); }],
       ['Rep Day',         function () { writeRepDay_(B); }],
@@ -737,6 +877,10 @@ function refreshReports() {
       ['Rep Funnel',      function () { writeRepFunnel_(B); }],
       ['Prospects Daily', function () { writeProspectsDaily_(B); }],
       ['Stage Movement',  function () { writeFunnel_(B); }],
+      ['Channels',        function () { writeChannels_(B); }],
+      ['Book Health',     function () { writeBookHealth_(B); }],
+      ['Disqualified',    function () { writeDisqualified_(B); }],
+      ['ICP',             function () { writeIcp_(B); }],
       ['Deal Board',      function () { writeDeals_(B); }],
       ['QC',              function () { writeQc_(B); }]
     ];
@@ -1180,6 +1324,338 @@ function writeExceptions_() {
  * counts on the day it was promoted. Reading current stage instead would delete a rep's
  * work retroactively every time a deal went bad.
  */
+/**
+ * rep -> rank, from the org chart (v_rep_order via channel_bundle).
+ *
+ * Returns null when the ordering is unavailable, which makes buildMatrix_ fall back to its
+ * volume sort rather than collapsing every column to the same rank. A missing bundle key
+ * should degrade the layout, never the data.
+ */
+function repOrderMap_(B) {
+  var order = B && B.rep_order;
+  if (!order || !order.length) return null;
+  var map = {};
+  for (var i = 0; i < order.length; i++) map[String(order[i].rep)] = i;
+  return map;
+}
+
+/**
+ * ICP - which kind of business actually converts.
+ *
+ * Three rules are enforced in the SQL rather than here, and the tab's job is to make them
+ * visible rather than to hide them behind clean-looking numbers:
+ *
+ *  - a rate on fewer than 30 WORKED contacts renders 'n<30', because there are 150 won deals
+ *    in the whole account and a 12-way split leaves ~12 wins per cell;
+ *  - every rate is over worked contacts, with untouched shown beside it, so a category
+ *    nobody has called cannot read as a category that does not convert;
+ *  - every number is a COUNT. Deal value is absent from this CRM by every route tested, so a
+ *    revenue-weighted view would be invention.
+ */
+function writeIcp_(B) {
+  var funnel = B.icp_funnel || [];
+  var score  = B.icp_scorecard || [];
+
+  var sh = ensureSheet_(TABS.ICP);
+  sh.clear();
+  clearBandings_(sh);
+  sh.setHiddenGridlines(true);
+
+  if (!funnel.length) {
+    renderTable_(sh, 1, TABS.ICP, [['value', 'Segment']], [],
+      'No ICP data. Apply migrations 023/024, then run scripts\\pipeline\\12-load-contact-book.ps1.');
+    return;
+  }
+
+  // Split by dimension so each cut gets its own titled block. A single 200-row table mixing
+  // ads, category, city and source reads as noise.
+  var byDim = {};
+  for (var i = 0; i < funnel.length; i++) {
+    var d = String(funnel[i].dimension);
+    if (!byDim[d]) byDim[d] = [];
+    byDim[d].push(funnel[i]);
+  }
+
+  var ads = byDim['ads'] || [];
+  var adsYes = null, adsNo = null;
+  for (var a = 0; a < ads.length; a++) {
+    if (String(ads[a].value) === 'Yes') adsYes = ads[a];
+    if (String(ads[a].value) === 'No')  adsNo  = ads[a];
+  }
+
+  var r = renderKpis_(sh, 1, [
+    { label: 'Runs Meta ads', value: adsYes ? Number(adsYes.contacts) : 0, format: '#,##0' },
+    { label: 'Ads: prospect rate', value: (adsYes && adsYes.prospect_pct !== null) ? Number(adsYes.prospect_pct) : 0, format: '0.0"%"' },
+    { label: 'No ads: prospect rate', value: (adsNo && adsNo.prospect_pct !== null) ? Number(adsNo.prospect_pct) : 0, format: '0.0"%"' }
+  ]);
+
+  var cols = [
+    ['value', 'Segment'], ['contacts', 'Contacts'], ['untouched', 'Untouched'],
+    ['worked', 'Worked'], ['connected', 'Connected'], ['prospects', 'Prospects'],
+    ['deals', 'Deals'], ['won', 'Won'],
+    ['connect_pct', 'Connect %'], ['prospect_pct', 'Prospect %'], ['win_pct', 'Win %'],
+    ['suppressed', 'Note']
+  ];
+
+  var titles = {
+    ads:      'By Meta-ads status',
+    category: 'By category',
+    city:     'By city',
+    source:   'By source'
+  };
+  var order = ['ads', 'category', 'city', 'source'];
+
+  for (var o = 0; o < order.length; o++) {
+    var dim = order[o];
+    if (!byDim[dim] || !byDim[dim].length) continue;
+    r = renderTable_(sh, r + 1, titles[dim] || dim, cols, byDim[dim],
+      dim === 'ads'
+        ? 'mx_Ads is filled on 99.7% of the ICP list and holds exactly Yes/No. Rates are over ' +
+          'WORKED contacts - Untouched is shown so an unworked segment is not read as a weak one.'
+        : 'Rates over worked contacts. "n<30" means the cell is too small to quote, not zero.',
+      { freeze: (o === 0) });
+  }
+
+  if (score.length) {
+    renderTable_(sh, r + 1, 'Lift against the account baseline',
+      [['dimension', 'Cut'], ['value', 'Segment'], ['worked', 'Worked'],
+       ['prospect_pct', 'Prospect %'], ['baseline_prospect_pct', 'Baseline %'],
+       ['prospect_lift_pp', 'Lift (pp)'], ['connect_lift_pp', 'Connect lift (pp)']],
+      score,
+      'Only cells that survived suppression appear here. A 6% prospect rate means nothing ' +
+      'until you know what the account runs at.');
+  }
+
+  autoWidth_(sh, cols, funnel);
+}
+
+/**
+ * CHANNELS - what reaches contacts, and on which channel.
+ *
+ * The headline is deliberately the channel MIX, not the volume: the point of the tab is
+ * whether outreach is still entirely phone. Measured 2026-08-11 it is - every rep is 100%
+ * phone, and the only WhatsApp belongs to a System broadcast account.
+ *
+ * Actor kind is shown because it decides whether a number is anyone's work. WhatsApp reaches
+ * ~2,700 contacts but has one actor; crediting that to reps would invent outreach nobody did,
+ * the same error as counting the Callkaro AI dialler as rep activity.
+ */
+function writeChannels_(B) {
+  var day = B.channel_day || [];
+  var mix = B.channel_mix || [];
+
+  var sh = ensureSheet_(TABS.CHANNELS);
+  sh.clear();
+  clearBandings_(sh);
+  sh.setHiddenGridlines(true);
+
+  if (!day.length && !mix.length) {
+    renderTable_(sh, 1, TABS.CHANNELS, [['channel', 'Channel']], [],
+      'No channel activity stored yet. Migrations 015/017 applied, and the channel webhooks live?');
+    return;
+  }
+
+  var byChannel = {}, totalTouches = 0;
+  for (var i = 0; i < day.length; i++) {
+    var c = String(day[i].channel);
+    if (!byChannel[c]) byChannel[c] = { channel: c, touches: 0, contacts: 0, inbound: 0, outbound: 0 };
+    byChannel[c].touches  += Number(day[i].touches) || 0;
+    byChannel[c].contacts += Number(day[i].contacts) || 0;
+    byChannel[c].inbound  += Number(day[i].inbound) || 0;
+    byChannel[c].outbound += Number(day[i].outbound) || 0;
+    totalTouches += Number(day[i].touches) || 0;
+  }
+  var chRows = [];
+  for (var kk in byChannel) if (byChannel.hasOwnProperty(kk)) chRows.push(byChannel[kk]);
+  chRows.sort(function (a, b) { return b.touches - a.touches; });
+  for (var z = 0; z < chRows.length; z++) {
+    chRows[z].share_pct = totalTouches ? Math.round(1000 * chRows[z].touches / totalTouches) / 10 : 0;
+  }
+
+  // How many reps use anything other than the phone. This single number is what the tab
+  // exists to answer, so it goes at the top rather than being inferred from the grid.
+  var repChannels = {}, multiChannelReps = 0;
+  for (var m = 0; m < mix.length; m++) {
+    var rp = String(mix[m].rep);
+    if (!repChannels[rp]) repChannels[rp] = {};
+    repChannels[rp][String(mix[m].channel)] = true;
+  }
+  for (var rq in repChannels) {
+    if (!repChannels.hasOwnProperty(rq)) continue;
+    var ks = 0;
+    for (var kx in repChannels[rq]) if (repChannels[rq].hasOwnProperty(kx)) ks++;
+    if (ks > 1) multiChannelReps++;
+  }
+
+  var r = renderKpis_(sh, 1, [
+    { label: 'Touches (all channels)', value: totalTouches, format: '#,##0' },
+    { label: 'Channels in use', value: chRows.length, format: '#,##0' },
+    { label: 'Reps using >1 channel', value: multiChannelReps, format: '#,##0',
+      color: multiChannelReps === 0 ? '#b06000' : null }
+  ]);
+
+  r = renderTable_(sh, r, 'Touches by channel',
+    [['channel', 'Channel'], ['touches', 'Touches'], ['contacts', 'Contacts'],
+     ['outbound', 'Outbound'], ['inbound', 'Inbound'], ['share_pct', 'Share']],
+    chRows,
+    'A touch is outreach we performed. System events, email opens and the Callkaro AI dialler ' +
+    'are stored but excluded here - they are not work anybody did.',
+    { freeze: true });
+
+  renderTable_(sh, r + 1, 'Channel mix by actor',
+    [['rep', 'Actor'], ['channel', 'Channel'], ['touches', 'Touches'],
+     ['contacts', 'Contacts'], ['pct_of_rep_touches', 'Share of actor']],
+    mix.slice(0, 120),
+    'An actor with 100% phone uses no other channel at all. WhatsApp with a single actor is a ' +
+    'broadcast integration, not rep outreach, and must not be credited to a rep.');
+
+  autoWidth_(sh, [['channel', 'Channel'], ['touches', 'Touches']], chRows);
+}
+
+/**
+ * BOOK HEALTH - is a rep's existing book worked out, or just untouched?
+ *
+ * Advisory only (Kaustubh, 2026-08-11): this gates nothing. It is the evidence a human uses
+ * when a rep asks for fresh leads.
+ *
+ * The bucket thresholds are MEASURED, not chosen - the attempt curve says the marginal dial
+ * still connects at 15-17% through the fourth attempt and halves at the fifth.
+ */
+function writeBookHealth_(B) {
+  var rows = B.book_health || [];
+
+  var sh = ensureSheet_(TABS.BOOK_HEALTH);
+  sh.clear();
+  clearBandings_(sh);
+  sh.setHiddenGridlines(true);
+
+  if (!rows.length) {
+    renderTable_(sh, 1, TABS.BOOK_HEALTH, [['rep', 'Rep']], [],
+      'No saturation data. Migrations 016/018 applied?');
+    return;
+  }
+
+  var recoverable = 0, exhausted = 0, never = 0, oneAndDone = 0;
+  for (var i = 0; i < rows.length; i++) {
+    recoverable += Number(rows[i].recoverable) || 0;
+    exhausted   += Number(rows[i].exhausted) || 0;
+    never       += Number(rows[i].never_touched) || 0;
+    oneAndDone  += Number(rows[i].one_and_done) || 0;
+  }
+
+  var r = renderKpis_(sh, 1, [
+    { label: 'Recoverable', value: recoverable, format: '#,##0', color: '#b06000' },
+    { label: 'Never touched', value: never, format: '#,##0' },
+    { label: 'Dialled once, dropped', value: oneAndDone, format: '#,##0' },
+    { label: 'Genuinely worked out', value: exhausted, format: '#,##0' }
+  ]);
+
+  renderTable_(sh, r, 'Book health by rep',
+    [['rep', 'Rep'], ['contacts', 'Contacts'], ['never_touched', 'Never touched'],
+     ['one_and_done', '1 & dropped'], ['under_worked', 'Under-worked'],
+     ['connected_no_progress', 'Stalled'], ['connected_recent', 'Live now'],
+     ['saturated', 'Worked out'], ['terminal', 'Closed'],
+     ['recoverable', 'Recoverable'], ['recoverable_pct', 'Recoverable %'],
+     ['mean_attempts', 'Mean dials'], ['with_assignment_history', 'Ageing coverage']],
+    rows,
+    'Recoverable = never touched + dialled once and dropped + under-worked + stalled after a ' +
+    'conversation. "Live now" is a conversation inside the last 7 days and is neither. ' +
+    '"Ageing coverage" is how many of the rep\'s contacts have assignment history loaded - ' +
+    'the ageing columns describe that subset only.',
+    { freeze: true });
+
+  autoWidth_(sh, [['rep', 'Rep']], rows);
+}
+
+/**
+ * DISQUALIFIED - how much of the disqualified pile is explained, and who is adding to it.
+ *
+ * Current state comes from the daily BOOK scan, not from dim_contact: the warehouse has
+ * enriched ~17,800 contacts of 91,047, so a per-rep percentage built on dim_contact would
+ * describe whichever slice of a rep's book happened to have been called recently. The real
+ * disqualified pile is 61,375.
+ *
+ * Movement comes from v_stage_history and is exact from 1 August.
+ */
+function writeDisqualified_(B) {
+  var byRep    = B.disq_by_rep || [];
+  var reasons  = B.disq_reasons || [];
+  var totals   = B.disq_totals || [];
+  var movement = B.disq_movement || [];
+
+  var sh = ensureSheet_(TABS.DISQUALIFIED);
+  sh.clear();
+  clearBandings_(sh);
+  sh.setHiddenGridlines(true);
+
+  if (!byRep.length && !movement.length) {
+    renderTable_(sh, 1, TABS.DISQUALIFIED, [['rep', 'Rep']], [],
+      'No disqualification snapshot yet. Apply migration 022, then run 03-snapshot-book.ps1.');
+    return;
+  }
+
+  var tot = 0, withReason = 0;
+  for (var i = 0; i < byRep.length; i++) {
+    tot        += Number(byRep[i].disqualified) || 0;
+    withReason += Number(byRep[i].with_reason) || 0;
+  }
+
+  var r = renderKpis_(sh, 1, [
+    { label: 'Disqualified (whole book)', value: tot, format: '#,##0' },
+    { label: 'With a reason', value: withReason, format: '#,##0' },
+    { label: 'No reason', value: tot - withReason, format: '#,##0',
+      color: (tot - withReason) > 0 ? '#b06000' : null },
+    { label: 'Reason captured', value: tot ? Math.round(1000 * withReason / tot) / 10 : 0,
+      format: '0.0"%"' }
+  ]);
+
+  r = renderTable_(sh, r, 'Disqualified contacts by rep',
+    [['rep', 'Rep'], ['disqualified', 'Disqualified'], ['with_reason', 'With reason'],
+     ['no_reason', 'No reason'], ['pct_with_reason', 'With reason %'],
+     ['distinct_reasons', 'Distinct reasons']],
+    byRep,
+    'From the daily full-book scan, so these are whole-book numbers rather than only the ' +
+    'contacts the pipeline has enriched. A blank reason is unrecoverable - nobody can ' +
+    'reconstruct later why an account was closed.',
+    { freeze: true });
+
+  // Reason split, pivoted at render time. The reason list is NOT stable - new values keep
+  // appearing - so a view with a fixed column per reason would silently drop any value
+  // invented after it was written.
+  if (reasons.length) {
+    var mR = buildMatrix_(reasons, 'rep', 'reason', 'contacts', repOrderMap_(B));
+    var colDefs = [['_row', 'Rep']];
+    for (var c = 0; c < mR.cols.length; c++) colDefs.push(['c' + c, mR.cols[c]]);
+    colDefs.push(['_total', 'Total']);
+    r = renderTable_(sh, r + 1, 'Split by disqualification reason',
+      colDefs, mR.rows.concat([mR.totalRow]),
+      'Reasons marked in the account but not selectable in the dropdown are still counted ' +
+      'here - LSQ stores them happily, and reps cannot filter on them.',
+      { totalRow: mR.rows.length });
+  }
+
+  if (totals.length) {
+    r = renderTable_(sh, r + 1, 'Reason totals, whole account',
+      [['reason', 'Reason'], ['contacts', 'Contacts'], ['pct', 'Share'],
+       ['non_canonical', 'Not selectable']],
+      totals, null);
+  }
+
+  if (movement.length) {
+    var mM = buildMatrix_(movement, 'report_date', 'rep', 'disqualified', repOrderMap_(B));
+    var mDefs = [['_row', 'Date (IST)']];
+    for (var c2 = 0; c2 < mM.cols.length; c2++) mDefs.push(['c' + c2, mM.cols[c2]]);
+    mDefs.push(['_total', 'Total']);
+    renderTable_(sh, r + 1, 'Contacts moved to Disqualified, per day',
+      mDefs, mM.rows.concat([mM.totalRow]),
+      'From 1 August, when stage history begins. Credited to the contact owner rather than ' +
+      'whoever clicked - an admin sweep still belongs to the book it came from.',
+      { totalRow: mM.rows.length });
+  }
+
+  autoWidth_(sh, [['rep', 'Rep']], byRep);
+}
+
 function writeProspectsDaily_(B) {
   var rows = B.prospects_daily || [];
 
@@ -1194,7 +1670,7 @@ function writeProspectsDaily_(B) {
     return;
   }
 
-  var m = buildMatrix_(rows, 'report_date', 'rep', 'prospects_created');
+  var m = buildMatrix_(rows, 'report_date', 'rep', 'prospects_created', repOrderMap_(B));
   var colDefs = [['_row', 'Date (IST)']];
   for (var i = 0; i < m.cols.length; i++) colDefs.push(['c' + i, m.cols[i]]);
   colDefs.push(['_total', 'Total']);
@@ -1234,7 +1710,7 @@ function writeProspectsDaily_(B) {
  * Columns are ordered by their own total descending - the busiest rep first - which is what
  * a reader scans for. Alphabetical would bury the answer.
  */
-function buildMatrix_(rows, rowKey, colKey, valKey) {
+function buildMatrix_(rows, rowKey, colKey, valKey, colOrder) {
   var colTotals = {}, rowMap = {}, rowKeys = [];
   for (var i = 0; i < rows.length; i++) {
     var rk = String(rows[i][rowKey]);
@@ -1244,7 +1720,21 @@ function buildMatrix_(rows, rowKey, colKey, valKey) {
     rowMap[rk][ck] = (rowMap[rk][ck] || 0) + v;
     colTotals[ck] = (colTotals[ck] || 0) + v;
   }
-  var cols = Object.keys(colTotals).sort(function (a, b) { return colTotals[b] - colTotals[a]; });
+  // Column order. Default is descending volume, which is right for a disposition pivot but
+  // wrong for a rep grid - it reshuffles the columns every day as volumes move, so nobody
+  // can find their own team twice running. When colOrder is supplied (rep -> rank) the grid
+  // is laid out by the org chart instead: team, lead first, then org-chart order.
+  //
+  // A rep with no rank sorts LAST rather than being dropped, and falls back to volume among
+  // its peers. A missing org-chart row must never make a rep's column disappear.
+  var cols = Object.keys(colTotals).sort(function (a, b) {
+    if (colOrder) {
+      var ra = (colOrder[a] === undefined) ? 1e9 : colOrder[a];
+      var rb = (colOrder[b] === undefined) ? 1e9 : colOrder[b];
+      if (ra !== rb) return ra - rb;
+    }
+    return colTotals[b] - colTotals[a];
+  });
 
   var out = [], grand = 0;
   var totalRow = { _row: 'TOTAL' };
@@ -1737,8 +2227,9 @@ function writeQc_(B) {
  */
 function orderTabs_() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var order = [TABS.DASHBOARD, TABS.REP_DAY, TABS.TREND, TABS.TEAMS, TABS.PIPELINE,
-               TABS.REP_FUNNEL, TABS.PROSPECTS, TABS.FUNNEL, TABS.DEALS, TABS.FORECAST,
+  var order = [TABS.DASHBOARD, TABS.REP_DAY, TABS.TREND, TABS.CHANNELS, TABS.TEAMS,
+               TABS.PIPELINE, TABS.BOOK_HEALTH, TABS.REP_FUNNEL, TABS.PROSPECTS,
+               TABS.FUNNEL, TABS.DISQUALIFIED, TABS.ICP, TABS.DEALS, TABS.FORECAST,
                TABS.EXCEPTIONS, TABS.QC, TABS.META, TABS.PENDING, TABS.UNPARSED];
   for (var i = 0; i < order.length; i++) {
     var sh = ss.getSheetByName(order[i]);

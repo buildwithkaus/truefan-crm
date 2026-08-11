@@ -68,8 +68,21 @@ if ($neg.Count -ne 0) { throw "NEGATIVE CONTROL FAILED - the filter is being ign
 # Full scan. Sorted by the IMMUTABLE CreatedOn: paging over a column that changes underneath
 # you reshuffles rows between pages and silently drops some.
 # ---------------------------------------------------------------------------------------
-$cols = "ProspectID,OwnerId,OwnerIdName,ProspectStage"
+# OwnerIdEmailAddress is carried for dim_rep.email. EventCode 3001 (LeadAssigned) identifies
+# owners ONLY as "Name (email)" - never as a GUID - so the email is the single safe join key
+# back to a rep. Collected here rather than in a separate job because this scan already sees
+# every owner in the account, and because a column filled "later" by something else is how
+# dim_rep sat empty for a week.
+$cols = "ProspectID,OwnerId,OwnerIdName,OwnerIdEmailAddress,ProspectStage,mx_Disqualification_Reason"
 $tally = @{}      # "ownerId|ownerName|stage" -> count
+$repEmail = @{}   # ownerId -> email
+# "ownerId|ownerName|reason" -> count, for contacts at Disqualified only.
+#
+# Tallied here rather than from dim_contact because dim_contact holds only the ~17,800
+# contacts the pipeline has enriched, of which 8,900 are Disqualified - against 61,375 in
+# the real book. A per-rep percentage computed on that slice would describe whichever part
+# of a rep's book happened to have been called recently, not their disqualified pile.
+$disqTally = @{}
 $total = 0
 $page = 1
 
@@ -90,6 +103,19 @@ while ($true) {
         if (-not $stage) { $stage = "<blank>" }
         $key = "$ownerId|$ownerName|$stage"
         if ($tally.ContainsKey($key)) { $tally[$key]++ } else { $tally[$key] = 1 }
+
+        $email = "$($r.OwnerIdEmailAddress)".Trim()
+        if ($email -and -not $repEmail.ContainsKey($ownerId)) { $repEmail[$ownerId] = $email }
+
+        if ($stage -eq "Disqualified") {
+            $reason = "$($r.mx_Disqualification_Reason)".Trim()
+            # A blank reason is stored as a real value, not skipped. A disqualification with
+            # no reason is the one gap that destroys information permanently - it has to be
+            # a countable row on the report rather than an absence that sums to nothing.
+            if (-not $reason) { $reason = "<blank>" }
+            $dk = "$ownerId|$ownerName|$reason"
+            if ($disqTally.ContainsKey($dk)) { $disqTally[$dk]++ } else { $disqTally[$dk] = 1 }
+        }
     }
     if ($page % 20 -eq 0) { Write-LsqLog "  page $page -> running total $total" $logPath }
     if ($rows.Count -lt 1000) { break }
@@ -194,6 +220,9 @@ foreach ($k in $tally.Keys) {
     [void]$repRows.Add([ordered]@{
         owner_id     = $oid
         lsq_name     = $nm
+        # Fixed key set on every row - PostgREST rejects a bulk insert whose objects differ
+        # (PGRST102), so the email must be present on all of them or none.
+        email        = $(if ($repEmail.ContainsKey($oid)) { $repEmail[$oid] } else { $null })
         is_active    = $true
         last_seen_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
     })
@@ -209,5 +238,53 @@ if ($repRows.Count -gt 0) {
     Write-LsqLog "Refreshed dim_rep: $($repRows.Count) owners." $logPath
 }
 
+# ---------------------------------------------------------------------------------------
+# Disqualification reason snapshot, from the SAME scan - no extra API calls.
+#
+# Written last, and after the book snapshot and dim_rep have already been persisted, so a
+# failure in this newer block cannot cost the day's book numbers.
+# ---------------------------------------------------------------------------------------
+$disqRows = New-Object System.Collections.Generic.List[object]
+$disqTotal = 0
+foreach ($dk in $disqTally.Keys) {
+    $parts = $dk.Split('|')
+    $disqTotal += $disqTally[$dk]
+    [void]$disqRows.Add([ordered]@{
+        snapshot_date = $SnapshotDate
+        owner_id      = $parts[0]
+        owner_name    = $parts[1]
+        reason        = $parts[2]
+        contacts      = $disqTally[$dk]
+    })
+}
+
+# Reconcile against the stage tally from the same pass. These are two independent counts of
+# the same population, so a mismatch means the reason branch missed rows - which would show
+# up as a quietly small disqualified pile, not as an error.
+$disqFromStages = 0
+foreach ($kk in $tally.Keys) { if ($kk.Split('|')[2] -eq "Disqualified") { $disqFromStages += $tally[$kk] } }
+Write-LsqLog "" $logPath
+Write-LsqLog ("Disqualified reconcile: reason tally {0} vs stage tally {1} -> {2}" -f `
+    $disqTotal, $disqFromStages, $(if ($disqTotal -eq $disqFromStages) { "OK" } else { "MISMATCH" })) $logPath
+if ($disqTotal -ne $disqFromStages) { throw "Disqualification tally does not reconcile to the stage tally. Refusing to write." }
+
+if ($disqRows.Count -gt 0) {
+    $all2 = $disqRows.ToArray()
+    $written2 = 0
+    for ($i = 0; $i -lt $all2.Count; $i += 500) {
+        $slice = $all2[$i..([Math]::Min($i + 499, $all2.Count - 1))]
+        $j2 = ConvertTo-Json -InputObject $slice -Depth 4
+        if ($slice.Count -eq 1) { $j2 = "[$j2]" }
+        [void](Invoke-LsqWithRetry -What "upsert fact_disqualification_snapshot" -Action {
+            Invoke-RestMethod -Uri "$sbUrl/rest/v1/fact_disqualification_snapshot" -Method Post `
+                -Body ([System.Text.Encoding]::UTF8.GetBytes($j2)) -Headers $headers `
+                -ContentType "application/json; charset=utf-8" -ErrorAction Stop
+        })
+        $written2 += $slice.Count
+    }
+    Write-LsqLog "Wrote $written2 disqualification rows ($disqTotal contacts, $($disqRows.Count) owner/reason pairs)." $logPath
+}
+
 Write-LsqLog "Verify independently rather than trusting this line:" $logPath
 Write-LsqLog "  GET /rest/v1/v_pipeline_state_wide?select=*" $logPath
+Write-LsqLog "  GET /rest/v1/v_disqualified_by_rep?select=*" $logPath

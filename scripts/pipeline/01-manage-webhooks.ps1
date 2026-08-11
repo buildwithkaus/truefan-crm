@@ -18,6 +18,11 @@
             the payload shape before committing to the full set.
   Create  - create the full set: outbound calls, inbound calls, the 203 outcome form, and
             lead stage change.
+  AddChannels - IDEMPOTENT. Subscribe to the non-call channels found by the activity census
+            (WhatsApp, Converse Chat, FB Lead Ads, forms, meetings, contract/payment, and the
+            new 209 Call Disposition). Lists what already exists first and creates only what
+            is missing, so it is safe to re-run. Use this rather than -Action Create, which
+            would try to recreate the three call hooks that are already live.
   Delete  - delete by -WebhookId.
 
 .EXAMPLE
@@ -31,7 +36,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet("List", "Test", "Create", "Delete")]
+    [ValidateSet("List", "Test", "Create", "AddChannels", "Delete")]
     [string]$Action = "List",
 
     [string]$Url,
@@ -91,6 +96,55 @@ $activityTargets = @(
     @{ Code = 22;  Name = "Outbound Phone Call Activity" }
     @{ Code = 21;  Name = "Inbound Phone Call Activity" }
     @{ Code = 203; Name = "01. Phone Call/ Follow Up" }
+)
+
+# The non-call channels, from the live activity census (scripts/pipeline/09-activity-census.ps1,
+# run 2026-08-10 over all 91,033 leads). Ordered by how much traffic each actually carries as
+# the LAST activity on a lead, which is a complete-population lower bound:
+#
+#   201  WhatsApp Message              7,700 leads   <- second-biggest channel in the account
+#   202  Facebook Lead Ads Submissions 2,997
+#   23   Lead Capture                  2,467
+#   97   Dynamic Form - Submission       449
+#   207  Converse Chat                     3
+#   209  Call Disposition                  0  <- created 2026-08-06, not yet used by reps
+#   102/103/104/105/200/204/205/206       ~1 combined
+#
+# The low-volume ones are still subscribed. A webhook costs nothing when it does not fire,
+# and there is NO bulk activity read - so a channel that starts being used without a
+# subscription is history that cannot be recovered later at any price.
+#
+# 209 in particular is subscribed BEFORE it has any traffic on purpose: it carries per-call
+# disposition, disqualification category/reason and a first-class Notes field, which is the
+# longest-standing gap in this CRM (0 notes captured, ever). The day a rep starts using it,
+# the data should already be flowing.
+#
+# NOT included: 208 (Callkaro AI dialler - excluded from every rep metric by design), and the
+# 3xxx system codes (3001 LeadAssigned, 3002 StageChange, 3006 LeadAssociated, 3011). The
+# 3xxx family does not appear in the ActivityTypes catalogue at all, so whether it can be
+# subscribed to is unknown - AddChannels probes 3001 last and reports the answer rather than
+# assuming either way.
+$channelTargets = @(
+    @{ Code = 201; Name = "WhatsApp Message" }
+    @{ Code = 202; Name = "Facebook Lead Ads Submissions" }
+    @{ Code = 23;  Name = "Lead Capture" }
+    @{ Code = 97;  Name = "Dynamic Form - Submission" }
+    @{ Code = 207; Name = "Converse Chat" }
+    @{ Code = 209; Name = "Call Disposition" }
+    @{ Code = 200; Name = "Zoom Meeting" }
+    @{ Code = 102; Name = "Meeting" }
+    @{ Code = 103; Name = "Had a Phone Conversation" }
+    @{ Code = 104; Name = "Left a Voice Mail" }
+    @{ Code = 105; Name = "Spoke with Gatekeeper" }
+    @{ Code = 204; Name = "02. Contract" }
+    @{ Code = 205; Name = "04. Sales Activity" }
+    @{ Code = 206; Name = "03. Payment" }
+)
+
+# Probed, not assumed. If a system event can be subscribed to, assignment history becomes
+# real-time instead of trail-only.
+$systemProbeTargets = @(
+    @{ Code = 3001; Name = "LeadAssigned" }
 )
 
 function Invoke-WebhookApi {
@@ -418,7 +472,97 @@ switch ($Action) {
 
         Write-LsqLog "" $logPath
         Write-LsqLog "VERIFY by independent re-fetch, not by the responses above:" $logPath
-        Write-LsqLog "  pwsh ./scripts/pipeline/01-manage-webhooks.ps1 -Action List" $logPath
+        Write-LsqLog "  powershell.exe -File scripts\pipeline\01-manage-webhooks.ps1 -Action List" $logPath
+    }
+
+    "AddChannels" {
+        if (-not $Url) { throw "-Url is required." }
+
+        # ------------------------------------------------------------------------------
+        # Read the CURRENT subscriptions first and subscribe only to what is missing.
+        #
+        # Idempotence is not a nicety here. -Action Create is non-idempotent (it would add a
+        # SECOND hook for each of the three call events already live, doubling every call row
+        # the pipeline ingests), and this account has already been bitten once by a
+        # non-idempotent create - OpportunityManagement.svc/Capture reported IsUnique:true on
+        # a genuine duplicate and left an un-deletable second opportunity behind.
+        # ------------------------------------------------------------------------------
+        $existing = Get-WebhookList -EventFilter "LeadActivity_Post_Create"
+        $haveCodes = @{}
+        foreach ($w in $existing.Rows) {
+            $code = ""
+            if ($w.WebhookProperties) {
+                try { $code = "$(($w.WebhookProperties | ConvertFrom-Json).ActivityEvent)" } catch { }
+            }
+            if ($code) { $haveCodes[$code] = "$($w.WebhookId)" }
+        }
+        Write-LsqLog "Already subscribed to activity codes: $(($haveCodes.Keys | Sort-Object) -join ', ')" $logPath
+
+        $wanted = @($channelTargets) + @($systemProbeTargets)
+        $todo = @($wanted | Where-Object { -not $haveCodes.ContainsKey("$($_.Code)") })
+
+        Write-LsqLog "" $logPath
+        Write-LsqLog "To create: $($todo.Count) of $($wanted.Count)" $logPath
+        foreach ($t in $todo) { Write-LsqLog "  $($t.Code) - $($t.Name)" $logPath }
+        if ($todo.Count -eq 0) { Write-LsqLog "Nothing to do - every channel is already subscribed." $logPath; break }
+
+        if (-not $Execute) {
+            Write-LsqLog "" $logPath
+            Write-LsqLog "DRY RUN - nothing created. Re-run with -Execute." $logPath
+            break
+        }
+
+        $created = 0; $failed = 0
+        foreach ($t in $todo) {
+            try {
+                $r = New-ActivityWebhook -ActivityEventCode $t.Code `
+                        -Description "TrueFan channels - $($t.Name)" `
+                        -TargetUrl $Url -HeaderSecret $Secret
+                Write-LsqLog "  created $($t.Code) $($t.Name) -> $($r.Message.Id)" $logPath
+                $created++
+            } catch {
+                $d = $_.ErrorDetails.Message; if (-not $d) { $d = $_.Exception.Message }
+                if ("$d" -match "already exists") {
+                    Write-LsqLog "  $($t.Code) $($t.Name) already exists (ok)" $logPath
+                } else {
+                    # A failure on a 3xxx system code is a FINDING, not an error - it answers
+                    # whether assignment history can ever be real-time.
+                    Write-LsqLog "  FAILED $($t.Code) $($t.Name) -> $d" $logPath
+                    $failed++
+                }
+            }
+            Start-Sleep -Milliseconds 400
+        }
+
+        # ------------------------------------------------------------------------------
+        # Read back what LeadSquared ACTUALLY created. The documented opportunity event codes
+        # were wrong on this account and following them put a DELETE listener on production
+        # while trying to create a Create listener. A create response is not evidence.
+        # ------------------------------------------------------------------------------
+        Write-LsqLog "" $logPath
+        Write-LsqLog "--- Read-back: what LSQ actually has now ---" $logPath
+        $after = Get-WebhookList -EventFilter "LeadActivity_Post_Create"
+        $afterCodes = @{}
+        foreach ($w in $after.Rows) {
+            $code = ""
+            if ($w.WebhookProperties) {
+                try { $code = "$(($w.WebhookProperties | ConvertFrom-Json).ActivityEvent)" } catch { }
+            }
+            if ($code) {
+                if ($afterCodes.ContainsKey($code)) { $afterCodes[$code]++ } else { $afterCodes[$code] = 1 }
+            }
+        }
+        foreach ($c in ($afterCodes.Keys | Sort-Object { [int]$_ })) {
+            $dupe = if ($afterCodes[$c] -gt 1) { "  <-- DUPLICATE x$($afterCodes[$c]), every event will ingest twice" } else { "" }
+            Write-LsqLog ("  {0,-6} subscribed{1}" -f $c, $dupe) $logPath
+        }
+
+        $missing = @($wanted | Where-Object { -not $afterCodes.ContainsKey("$($_.Code)") })
+        Write-LsqLog "" $logPath
+        Write-LsqLog "created $created, failed $failed, still missing $($missing.Count)" $logPath
+        foreach ($m in $missing) { Write-LsqLog "  NOT SUBSCRIBED: $($m.Code) $($m.Name)" $logPath }
+        Write-LsqLog "" $logPath
+        Write-LsqLog "A code that refuses to subscribe is a finding to record, not a retry." $logPath
     }
 
     "Delete" {

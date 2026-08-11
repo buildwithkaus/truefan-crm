@@ -540,6 +540,120 @@ maintained by the book snapshot.
 - Apps Script cannot read request headers, so the receiver uses a query-string secret.
   Obscurity, not a credential; acceptable because the endpoint only writes rows it was handed.
 
+## Phase 11 — All channels, ICP metrics, book saturation — **census done 2026-08-10; ingest built, not yet applied**
+
+Phase 10 measures the phone. This phase widens it to every channel LSQ records, adds the ICP
+dimension the warehouse has never had, and answers whether a rep's book is worked out before
+more leads are issued. Full plan and decisions: the approved plan file; findings: `memory/13`.
+
+**Decisions (Kaustubh, 2026-08-10):** book saturation is **advisory only** (no gate, no
+write-back to LSQ) · backfill scope **held** pending the census pricing below · analysis
+surfaces on the **existing Sheet + Excel** · scope is **only activity types LSQ already
+records** (no new custom types; LinkedIn and email-sends stay named blind spots).
+
+### 11a — Activity census — **done, read-only**
+
+`scripts/pipeline/09-activity-census.ps1`. Full book (91,033 leads, reconciled 91,033/91,033,
+negative control passed) plus two 300-lead trail strata that are never pooled.
+
+- **WhatsApp is the second-largest channel and is invisible to every report.** 60% of contacts
+  carry a 201, against 81% for outbound calls. 7,700 leads have it as their *last* activity.
+- **It has exactly one actor** across 600 sampled leads (calling has 27), so it is a broadcast
+  integration, not rep outreach, and must not be credited to reps.
+- **55% of WhatsApp messages that carry a status are `FAILED`.** Nobody is watching this.
+- **78.3% of contacts hold at least one non-call channel activity.**
+- **No money on activities.** 204/205/206 were the last hope for recoverable deal value: 1
+  activity found across 600 leads, 0 with an amount. **Funnel analysis stays count-based.**
+- **`ProspectActivity.svc/ActivityTypes.Get` exists** and is where the unattributed
+  `data/activity_types_schema.json` came from. 58 types live vs 57 cached.
+- **EventCode 209 "Call Disposition" was created 2026-08-06 and is unused.** It carries per-call
+  disposition, disqualification category/reason **and a first-class Notes field** — the two
+  longest-standing gaps in this CRM. Subscribed in advance of any traffic.
+- **EventCode 3001 `LeadAssigned` carries previous and new owner**, on 96% of contacts back to
+  Feb 2025. Assignment history is fully recoverable; "fresh *for me*" becomes computable.
+
+**Backfill pricing** (the decision this was run to inform): whole book 91,033 calls / 12 nights ·
+workable book 26,302 / 4 · touched since 1 Aug 16,092 / 3 · non-call last activity 16,366 / 3.
+
+### 11b — ICP field readiness — **done, read-only**
+
+`scripts/reports/enumerate-icp-readiness.ps1` — one scan for all 17 candidate fields rather than
+seventeen full scans.
+
+- **`mx_Ads` is real**: 31,198 filled, exactly `Yes` (2,059) / `No` (29,139), 99.7% filled on the
+  ICP population. **2,059 accounts confirmed running Meta ads** — enough for an ads cut with an
+  n>=30 rule across a few dimensions, not many at once.
+- **`mx_Category` is the industry dimension to use**: 55 clean values, **100% filled on the ICP
+  population**.
+- **`mx_Industry_Type` is unusable as a dropdown** — 11,515 stored values against 15 options,
+  56,831 leads unfilterable. Bigger than the 61,919-lead incident. Needs a decision, blocks
+  nothing.
+- Dead on the ICP population: Segment, Company revenue, Selected Product, Qualified Business,
+  State, Sub Sector, Marketing Budget, Country. **`mx_Categoey` (the typo field) is empty
+  everywhere — safe to retire.**
+
+### 11c — Channel ingest — **migrations applied and webhooks LIVE 2026-08-10 18:13 IST**
+
+Migrations `014` and `015` are applied (all 8 objects verified by independent read; `ref_channel`
+holds its 26 seed rows). **14 channel webhooks created, 17 activity subscriptions now live and
+ENABLED, zero duplicates** — verified by reading back what LSQ actually assigned, not from the
+create responses.
+
+**3001 `LeadAssigned` refused with HTTP 500** while all 14 catalogued types created cleanly. The
+3xxx system codes are in the trail but not in the ActivityTypes catalogue, and the webhook API
+only accepts catalogued types. `fact_assignment` is therefore trail-derived, which is fine — the
+history is already there, on 96% of contacts back to Feb 2025.
+
+**Outstanding and now urgent:** the updated `CallingPipeline.gs` is **not yet deployed**, so the
+new webhooks are firing at a receiver that still drops anything that is not 21/22/203. It returns
+200, so nothing will be disabled — but every WhatsApp event arriving in the meantime is being
+discarded rather than stored.
+
+### 11c (as built) — what the files do
+
+- `supabase/migrations/014_attempt_curve.sql` — attempt-depth hazard curve, disposition
+  durability, connect-by-hour. Runs entirely off existing `fact_call`.
+- `supabase/migrations/015_channels.sql` — `ref_channel` (seeded from the census, 26 rows),
+  `fact_touch`, `v_touch_all`, channel views, QC. `fact_call` is untouched.
+- `scripts/pipeline/01-manage-webhooks.ps1 -Action AddChannels` — idempotent; lists first,
+  creates only what is missing, reads back what LSQ actually assigned.
+- `appsscript/CallingPipeline.gs` — generic channel branch: anything not 21/22/203 lands in
+  `fact_touch`, classified in SQL. No new UrlFetch spend.
+
+**To apply** (there is no Supabase CLI and no DB URL here — migrations are pasted into the SQL
+editor): run `014` then `015`, then `-Action AddChannels -Url <exec url> -Execute`, then paste
+the updated `CallingPipeline.gs`.
+
+### 11d — Assignment history and book saturation — **LIVE 2026-08-11, all QC passing**
+
+Migrations `016` (assignment + saturation), `017` (channel QC fixes), `018` (recency fix) applied.
+2,500 contacts' trails loaded: 16,055 touches, 5,412 assignments, 0 failures. **All 9 QC checks
+PASS**, each against something that does not share its arithmetic.
+
+**Reps use exactly one channel.** Not one rep has a single non-phone touch. WhatsApp reaches
+2,691 contacts and is 100% a `System` broadcast. "Which channel converts better" cannot be asked
+yet — there is only one rep channel, and that is the finding.
+
+**Reps are not short of leads.** Of 17,811 contacts, **61 are genuinely worked out** and **1,911
+are recoverable** — 1,347 never dialled, 337 dialled once and dropped, 136 stalled after a
+conversation, 91 under-worked. Untouched pools concentrate in Mayank Arora (206), Rahul Madaan
+(181), Admin (175), adarsh pandey (142), Prakhar Gupta (136).
+
+**Three defects were caught by the QC rather than by anyone noticing a wrong number** — the
+argument for having it. EventCode 3011 turned out to be a mirror sharing its activity Id (so the
+census double-counted WhatsApp events and the upserts 500'd); opportunity webhooks arrive with no
+`ActivityEventName`; and `connected_no_progress` tested stage but not recency, putting 1,888 live
+conversations in a bucket labelled neglect. All three are recorded as gotchas 34–36.
+
+**Still open:** 15,167 contacts of the enriched book remain unloaded (one API call each), so
+`days_held` and `days_to_first_touch` currently describe ~16% of contacts. The buckets themselves
+do not depend on assignment history and are complete.
+
+### 11e — Still to build
+
+`dim_contact_book` (row-level ICP dimension), the ICP funnel and scorecard views,
+`fact_assignment` from 3001, and book saturation / book health.
+
 ---
 
 ## Sub-agent task breakdown

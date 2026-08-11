@@ -185,6 +185,46 @@ new script. One line each:
     through `dim_contact` and looked fine, so an empty join table survived a week; it only
     surfaced as a raw GUID appearing where a rep name belonged. Anything created empty and
     filled "later" needs the filling wired into a job that already runs.
+29. **`ProspectActivity.svc/ActivityTypes.Get` (a GET) is the activity-type catalogue** -
+    58 types with full form metadata. `data/activity_types_schema.json` had sat in `data/`
+    with no generator and no provenance; this is where it came from. Re-pull it rather than
+    trusting the cache: it was one type stale within two weeks.
+30. **A typed script PARAMETER reserves its name for the entire script, case-insensitively.**
+    `$touchedSince = 0` against a `[string]$TouchedSince` parameter coerces straight back to
+    the string `"0"`, and `$touchedSince++` then throws *90 pages into a scan*. Same family
+    as the `$pid`/`$host` trap in gotcha 19. Also: a hashtable member named `Count` is
+    shadowed by the intrinsic `Count`, so `$h.Count++` silently reads the entry count.
+31. **`pwsh` is not installed on this machine** - it is Windows PowerShell 5.1 only, despite
+    every `.EXAMPLE` in this repo saying `pwsh ./scripts/...`. Use `powershell.exe -File`.
+    The wrong one fails with `CommandNotFoundException` while the *wrapper* still exits 0.
+32. **`mx_Industry_Type` is a 15-option dropdown holding 11,515 distinct stored values**,
+    11,503 of them not selectable - 56,831 leads a rep cannot filter. Same failure as
+    gotcha 10 and larger than the 61,919-lead incident. Use **`mx_Category`** (55 clean
+    values, 100% filled on the ICP population) as the industry dimension instead.
+33. **EventCode 3001 `LeadAssigned` carries `PreviousOwner` and `CurrentOwner` in `Data[]`**
+    (as `Name (email)`, no `ActivityFields`), on 96% of contacts back to Feb 2025. This is
+    the only source of assignment history - it makes "fresh *for me*", time-to-first-touch
+    and lead ageing computable. **Join on the email, never the name.**
+34. **EventCode 3011 is a MIRROR, not an activity.** A `3011|WhatsApp Message` carries the
+    **same top-level `Id`** as the `201` it shadows, and `3011|Opportunity` the same Id as its
+    `12000`. Counting both double-counts WhatsApp, and writing both makes PostgreSQL refuse
+    the `ON CONFLICT` (it cannot touch a row twice) - which PostgREST returns as an opaque
+    **HTTP 500** that the retry wrapper then repeats four times. Never store 3011.
+35. **`CREATE OR REPLACE VIEW` can only APPEND columns** - never rename or reorder
+    (`ERROR 42P16`). Adding a column mid-list means dropping the view, and its dependents
+    first, in reverse dependency order. Hit in 012 and again in 018.
+36. **A bucket that tests state but not time inverts who looks good.** `connected_no_progress`
+    meant "connected and still Engaged" with no recency test: 2,024 contacts, of which 1,888
+    had been spoken to within 7 days. It labelled live conversations as neglect and made the
+    most active reps look worst. Same family as counting Callkaro as rep work. Any
+    "not progressing" definition needs a staleness clause **and** a QC check asserting it.
+37. **The 3xxx system event codes cannot be subscribed to.** `Webhook.svc/Create` with
+    `ActivityEvent=3001` returns **HTTP 500** while all 14 real activity types created fine
+    in the same run (2026-08-10). They exist in the activity trail but not in the
+    ActivityTypes catalogue, and the webhook API only accepts catalogued types. So
+    `fact_assignment` is a **trail-derived** table, not a webhook-fed one; the forward-looking
+    fallback is a `Lead_Field_Change` hook on `OwnerId`, which is a different mechanism and
+    is untested.
 29. **Apps Script concatenates every `.gs` in a project into ONE global scope; the last
     definition of a name wins**, with no module system and no warning. `WebhookCapture.gs`
     and `CallingPipeline.gs` both define `doPost`/`ok_`; the archived `SheetsSync.gs` collides
