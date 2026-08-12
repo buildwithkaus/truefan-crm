@@ -31,7 +31,14 @@
 # Target stage values
 # ---------------------------------------------------------------------------------------
 
-$Script:ContactStages = @("Fresh", "Engaged", "Prospect", "Customer", "Disqualified")
+# Six values, not five. 'Future Prospect' was originally modelled as a Company stage only,
+# and the 2026-07-31 restructure therefore treated it as a legacy CONTACT value and mapped it
+# to Disqualified. That was wrong: it is a real contact stage (Kaustubh, 2026-08-12), meaning
+# "right business, no need right now" - a live revisit list, not a closed account.
+#
+# The cost of the earlier reading: 2,729 contacts were moved to Disqualified on 2026-08-11
+# and had to be rolled back the next day, after reps noticed their accounts had gone.
+$Script:ContactStages = @("Fresh", "Engaged", "Prospect", "Customer", "Disqualified", "Future Prospect")
 
 $Script:CompanyStages = @("Fresh", "Nurture", "Opportunity", "Customer", "Future Prospect")
 
@@ -155,7 +162,15 @@ $Script:StageMap = @{
     "No Requirement of Celeb in Ads" = @{ Contact = "Disqualified"; Company = "Future Prospect"
         Reason = "No Celebrity Requirement"; Category = "Not ICP Fit" }
 
-    "Future Prospect" = @{ Contact = "Disqualified"; Company = "Future Prospect"
+    # 'Future Prospect' maps to ITSELF on the contact. It is a canonical stage, not a legacy
+    # value to be translated away.
+    #
+    # This entry must stay in the map rather than being deleted: 12-reconcile-contacts.ps1
+    # treats an unmapped stored value as 'Unmapped' and reports it as drift needing
+    # attention, so removing it would trade a wrong migration for a permanent false alarm.
+    # Mapping it to itself makes the reconciler a no-op for these contacts, which is exactly
+    # what is wanted - it will keep filling Reason and Category, which are still correct.
+    "Future Prospect" = @{ Contact = "Future Prospect"; Company = "Future Prospect"
         Reason = "No Current Requirement (Timing)"; Category = "No Requirement" }
     "Just Enquiring, No Intent" = @{ Contact = "Disqualified"; Company = "Future Prospect"
         Reason = "Just Enquiring - No Intent"; Category = "No Requirement" }

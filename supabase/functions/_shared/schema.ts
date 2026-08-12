@@ -87,12 +87,22 @@ export const LEAD_COLUMNS = [
 // Canonical values. Also seeded into ref_canonical_value so SQL can check membership; kept
 // here too for edge-function-side validation and for tests.
 // ---------------------------------------------------------------------------------------
+/**
+ * Six values. 'Future Prospect' was originally modelled as a Company stage only, so the
+ * 2026-07-31 restructure treated it as a legacy CONTACT value and mapped it to Disqualified.
+ * It is a real contact stage (Kaustubh, 2026-08-12): "right business, no need right now" -
+ * a live revisit list rather than a closed account.
+ *
+ * Reading it as legacy moved 2,729 contacts to Disqualified on 2026-08-11, which had to be
+ * rolled back the next day after reps noticed their accounts had gone.
+ */
 export const CONTACT_STAGES = [
   "Fresh",
   "Engaged",
   "Prospect",
   "Customer",
   "Disqualified",
+  "Future Prospect",
 ] as const;
 
 /** The six live mx_Call_Disposition dropdown options, read from the field on 2026-07-31. */
