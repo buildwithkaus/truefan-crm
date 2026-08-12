@@ -15,9 +15,18 @@ Reps see three objects. Each answers exactly one question. No value appears in t
 
 ```
 Fresh -> Engaged -> Prospect -> Customer
-                 \
-                  -> Disqualified (+ reason, mandatory)
+                 |
+                 +-> Future Prospect (+ reason)   right business, wrong time - REVISIT
+                 |
+                 +-> Disqualified    (+ reason, mandatory)   out of play
 ```
+
+Six values, not five. **`Future Prospect` and `Disqualified` are not the same exit** and the
+difference is the whole point: a future prospect is an account waiting on timing and should
+come back; a disqualified contact is out of play. Collapsing the two - which this document
+originally did - removes 2,700-odd live accounts from the reps working them.
+
+*(Corrected 2026-08-12. See the note above the mapping table in section 4.)*
 
 **Company (Account) — "where is this *account*?"**
 
@@ -190,6 +199,23 @@ at all.
 **Every string in the table below is copied from live data. Do not retype them.** The
 migration script must read them from a generated worklist, never from a hand-written literal.
 
+> **CORRECTED 2026-08-12 — `Future Prospect` is a CONTACT stage.** This table originally
+> mapped it to `Disqualified`, on the reading that it was only a Company stage. It is not: it
+> is a live contact stage meaning *"right business, no need right now"* — an account waiting
+> on timing, not a closed one.
+>
+> The original mapping was executed on 2026-08-11 and moved **2,729 contacts** into
+> `Disqualified`. Reps noticed their accounts had gone, and all 2,726 still eligible were
+> rolled back on 2026-08-12 (`scripts/migration/18-rollback-future-prospect.ps1`).
+>
+> `Future Prospect` now maps to **itself**. It stays in `$StageMap` rather than being removed,
+> because `12-reconcile-contacts.ps1` reports an unmapped stored value as drift — deleting the
+> entry would trade a wrong migration for a permanent false alarm. Reason and Category are
+> still filled; only the stage is left alone.
+>
+> **The contact model is therefore SIX values, not five.** Anything in this document that says
+> five is stale, including the diagram above.
+
 | Old `ProspectStage` (exact) | Count | -> Contact Stage | Disq. Reason (L2) | Category (L1) | Call Disposition | Source / Segment | -> Company Stage |
 |---|---|---|---|---|---|---|---|
 | `Fresh Lead` | 1,825 | Fresh | — | — | — | — | Fresh |
@@ -211,7 +237,7 @@ migration script must read them from a generated worklist, never from a hand-wri
 | `Low Budget` | 5,891 | Disqualified | Low Budget / Pricing Mismatch | Commercial Mismatch | — | — | Future Prospect |
 | `Wrong Number` | 4,753 | Disqualified | Invalid Contact Data | Unreachable / Bad Data | — | — | **Nurture** (see note) |
 | **`Just Enquiring, No Intent`** *(comma)* | **2,736** | Disqualified | Just Enquiring - No Intent | No Requirement | — | — | Future Prospect |
-| `Future Prospect` | 2,686 | Disqualified | No Current Requirement (Timing) | No Requirement | — | — | Future Prospect |
+| `Future Prospect` | 2,686 | **Future Prospect** *(unchanged — see the note below)* | No Current Requirement (Timing) | No Requirement | — | — | Future Prospect |
 | `No Requirement of Celeb in Ads` | 1,901 | Disqualified | No Celebrity Requirement | **Not ICP Fit** | — | — | Future Prospect (suppressed) |
 | `Does not want AI` | 612 | Disqualified | Does Not Want AI | No Requirement (product-specific) | — | — | Future Prospect |
 | `B2B-Disqualified` | 543 | Disqualified | Out of ICP - B2B Not Relevant | **Not ICP Fit** | — | B2B | Future Prospect (suppressed) |

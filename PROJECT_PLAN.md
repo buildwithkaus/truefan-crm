@@ -151,7 +151,7 @@ folded into the Phase 5R night run, not run separately.
 `Call Disposition` and `Disqualification Reason` both carry forward into Phase 5R unchanged —
 they are reused by the locked design, not replaced. Step 3 of the original plan (cutting
 `ProspectStage` over to a clean list) is **superseded by Phase 5R below**, which replaces the
-6-value lifecycle sketch with the locked 5-value Contact model.
+6-value lifecycle sketch with the locked Contact model. (That model is itself now SIX values - Future Prospect was corrected from a legacy value to a real contact stage on 2026-08-12; see migration 030.)
 
 ## Phase 5R — Stage restructure across all three objects — **DATA MIGRATION DONE 2026-07-31; automations still outstanding**
 

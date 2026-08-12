@@ -26,12 +26,14 @@ they were only un-dialled. Those are coming back into your queues.
 
 ---
 
-## The five contact stages
+## The six contact stages
 
 ```
 Fresh  ->  Engaged  ->  Prospect  ->  Customer
-                    \
-                     ->  Disqualified (reason required)
+                    |
+                    +->  Future Prospect (reason required)   right business, wrong time
+                    |
+                    +->  Disqualified    (reason required)   out of play
 ```
 
 | Stage | Means |
@@ -40,7 +42,13 @@ Fresh  ->  Engaged  ->  Prospect  ->  Customer
 | **Engaged** | You have started working this contact. Either you reached a human, or you dialled and did not get through — **Call Disposition tells you which.** |
 | **Prospect** | There is a real deal here. A deal record gets created automatically. |
 | **Customer** | Payment received. |
+| **Future Prospect** | **Right business, wrong time.** They would buy, just not now. Still yours, still coming back. **Reason required.** |
 | **Disqualified** | Out of play. **Reason is mandatory.** |
+
+> **`Future Prospect` and `Disqualified` are not the same thing**, and the difference is the
+> one that pays you back. A future prospect is an account you will work again when the timing
+> changes. A disqualified contact is done. If you mark a "call me next quarter" as
+> Disqualified, nothing brings it back to you.
 
 **You own this field.** Two of the moves happen for you; one is your judgement call.
 
