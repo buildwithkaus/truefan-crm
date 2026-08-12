@@ -56,10 +56,11 @@ Mapped onto LeadSquared's fixed, non-editable Opportunity `Status`:
 
 | Object | Stage | Means |
 |---|---|---|
-| Contact | Fresh | Never had a live conversation. Includes every un-connected dial attempt. |
-| Contact | Engaged | Reached a human, pitch delivered or in progress, no stated requirement yet. |
+| Contact | Fresh | **Nobody has dialled this contact yet.** The hunting pool. *(Redefined 2026-07-31: un-connected dial attempts were moved OUT to Engaged - 17,011 leads - because they were burying the bucket reps hunt in.)* |
+| Contact | Engaged | You have started working this contact - reached a human, OR dialled without connecting. **Call Disposition tells you which.** Accepted trade-off of the 2026-07-31 change: Engaged no longer means `reached a human` (~79% is dial attempts). |
 | Contact | Prospect | Stated a requirement. An Opportunity exists and this contact owns it. |
 | Contact | Customer | Their deal reached Opportunity stage = Customer. |
+| Contact | Future Prospect | **Right business, wrong time.** Would buy, not now. Still the rep's account, still comes back. Reason required. *(Added 2026-08-12.)* |
 | Contact | Disqualified | Out of play. Reason mandatory. |
 | Company | Fresh | No contact at this account has ever connected. |
 | Company | Nurture | At least one contact engaged, no requirement stated yet. |
@@ -219,11 +220,11 @@ migration script must read them from a generated worklist, never from a hand-wri
 | Old `ProspectStage` (exact) | Count | -> Contact Stage | Disq. Reason (L2) | Category (L1) | Call Disposition | Source / Segment | -> Company Stage |
 |---|---|---|---|---|---|---|---|
 | `Fresh Lead` | 1,825 | Fresh | — | — | — | — | Fresh |
-| `Didn't Picked` | 12,094 | Fresh | — | — | Did Not Pick | — | Fresh |
-| `RNR` | 276 | Fresh | — | — | RNR (5+ dials) | — | Fresh |
-| `Switched Off/Not Reachable` | 4,649 | Fresh | — | — | Switched Off / Not Reachable | — | Fresh |
-| `Call me Later` | 1,436 | Engaged | — | — | Call Me Later | — | Nurture |
-| `Follow Up` | 2,558 | Engaged | — | — | Follow Up (pitch delivered) | — | Nurture |
+| `Didn't Picked` | 12,094 | **Engaged** | — | — | Did Not Pick | — | **Nurture** |
+| `RNR` | 276 | **Engaged** | — | — | RNR | — | **Nurture** |
+| `Switched Off/Not Reachable` | 4,649 | **Engaged** | — | — | Switched Off/Not Reachable | — | **Nurture** |
+| `Call me Later` | 1,436 | Engaged | — | — | Call me Later | — | Nurture |
+| `Follow Up` | 2,558 | Engaged | — | — | Follow Up | — | Nurture |
 | `ReQualified By WhatsApp` | 7 | Engaged | — | — | — | WhatsApp Requalified | Nurture |
 | `Retargetedlead` | 92 | Engaged | — | — | — | Retargeted (WhatsApp) | Nurture |
 | `RetargetedleadEMAIL` | 0 | Engaged | — | — | — | Retargeted (Email) | Nurture |
