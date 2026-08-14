@@ -3,6 +3,10 @@
 Status as of 2026-08-09. Read `CLAUDE.md` first for orientation and the hard rules, and
 `docs/LSQ_API_GOTCHAS.md` for the API failure modes that apply to every phase below.
 
+Latest: **Phase 12** (2026-08-13) answers "why don't leads buy" from the calls that actually
+caused each disqualification — see `memory/14`. **Phase 11f** (2026-08-12) fixed the
+`channel_bundle` statement timeout by deleting work no tab rendered.
+
 **Where the project actually is:** the data-model work (Phases 1-5R) is done and reconciled.
 Phase 10 — the real-time calling pipeline — is **live and reconciling exactly** against an
 independent recount, and now covers the deal funnel end to end (10b, 10c). The live work is
@@ -653,6 +657,62 @@ do not depend on assignment history and are complete.
 
 `dim_contact_book` (row-level ICP dimension), the ICP funnel and scorecard views,
 `fact_assignment` from 3001, and book saturation / book health.
+
+## Phase 11f — The bundle timeout, cut rather than split (2026-08-12)
+
+Migration `031` plus `CallingPipeline.gs` `2026-08-12.1`. The ICP and Disqualified tabs went
+blank again. Neither was broken: `icp_bundle` answered in 2.0s with every key full. They were
+blank because `channel_bundle` was returning **HTTP 500 statement timeout** and the Apps Script
+fetched the ICP bundle from *inside* the channel bundle's try block, so one throw skipped the
+other fetch entirely.
+
+**Five of nine key sets in `channel_bundle` were rendered by nothing** — `non_owner`,
+`qc_channel`, `qc_saturation`, `qc_movement`, `unmapped` — 4.85s of an 8.62s bundle against an
+8s timeout. Enumerated by listing every `B.<key>` in the Apps Script, not assumed. Deleting
+them took the bundle to **3.77s**, better than 2x headroom; 027 materialised the ICP base and
+028 split the bundle, and both were back over the limit within a day, so a third split would
+have bought the same few seconds and a third round trip. The `v_qc_*` views are untouched —
+they are still queried directly by the QC logging.
+
+Also fixed: the health check looked for `icp_funnel`/`disq_by_rep` in the channel bundle, which
+they left in 028, so it reported ABSENT on every healthy run and blamed the wrong migration.
+
+## Phase 12 — Why leads don't buy: the disqualification analysis (2026-08-13) — **done, read-only**
+
+Full findings: **`memory/14-disqualification-analysis.md`**. Report artifact published; two
+workbooks in `data/`.
+
+Answered the standing question behind Phase 9 and 11: 67.6% of the book is Disqualified and 42%
+of that says `Not Interested - No Reason Stated` — what is actually going on?
+
+**The reason field is not diagnosis.** 96.7% of disqualifications carry a reason that is a
+rename of the legacy `ProspectStage` the contact already held, proven from
+`mx_Previous_Contact_Stage`. "98% have a reason" measures the migration, not the sales team.
+
+**Reps are not the problem.** Across all 1,520 contacts a *named rep* disqualified 1–13 Aug
+(bulk and admin writes excluded): **4.92 calls** on average beforehand, 92.8% connected first,
+88.6% disqualified straight after a connected call and 93.8% within the hour. An earlier
+"1.38 calls" figure was wrong — it counted only the warehouse window, not full history.
+
+**200 disqualifying calls read in full** (the one-connected-call, `No Reason Stated`, transcribed
+cohort): 48% genuinely produced no obtainable reason, 23.5% should never have been dialled,
+11% gave a real commercial reason, and **7% were lost by our own process** — an existing customer
+cold-called, a Prospect-stage partner dropped, opt-outs still being dialled, nine who asked for
+material and were marked Not Interested anyway. **Price appears 3 times in 200.**
+
+**ICP enrichment bought reachability, not demand** — no industry, city or ads signal separates
+buyers anywhere in the book. **Lead quality is a channel problem**: 31% of FB Lead Ads and 48%
+of `Inbound Phone call` are marked "not a business", against 0.4% on the manual ICP list.
+
+Six gotchas came out of this and are in `CLAUDE.md` (39–44). The expensive one is **41**: the
+first pass analysed 299 calls *to* disqualified contacts as if each were the disqualifying call,
+which it was not, and published a conclusion that had to be withdrawn.
+
+**Still open, all business decisions rather than engineering:** qualify the list before it
+reaches a rep (biggest lever, sits outside sales); put call history, stage and opt-out status on
+the dialler screen; add monthly ad spend as a qualifying field; make disposition + a one-line
+note mandatory on a connected call; make Closed-Lost real. **Do not** respond to this by pushing
+reps to dial more or disqualify less.
 
 ---
 

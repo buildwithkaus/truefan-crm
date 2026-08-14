@@ -15,7 +15,9 @@ orientation and hard rules.
 
 ```
 scripts/
-  lib/         common.ps1 (auth, request helpers, all API workarounds), schema.ps1 (stage taxonomy)
+  lib/         common.ps1 (auth, request helpers, all API workarounds), schema.ps1 (stage
+               taxonomy), activity.ps1 (the activity-trail block), xlsx.ps1 (writes .xlsx
+               directly - use this, not Excel COM, for anything large: gotcha 42)
   reports/     recurring READ-ONLY reporting - the day-to-day tools. Safe to re-run any time.
   migration/   the one-time 2026-07-30/31 stage restructure. Done. Kept for audit + rollback.
   sync/        stage-sync engine and its rules/tests
@@ -225,13 +227,48 @@ new script. One line each:
     `fact_assignment` is a **trail-derived** table, not a webhook-fed one; the forward-looking
     fallback is a `Lead_Field_Change` hook on `OwnerId`, which is a different mechanism and
     is untested.
-29. **Apps Script concatenates every `.gs` in a project into ONE global scope; the last
+38. **Apps Script concatenates every `.gs` in a project into ONE global scope; the last
     definition of a name wins**, with no module system and no warning. `WebhookCapture.gs`
     and `CallingPipeline.gs` both define `doPost`/`ok_`; the archived `SheetsSync.gs` collides
     with nine more including `TABS` and `writeTable_`. If the wrong one loads last, live
     webhooks land in a capture sheet and never reach Supabase — and LeadSquared still gets its
     200, so nothing reports an error. **See `appsscript/README.md` for which file belongs in
     which project.**
+39. **The call transcript URL is `mx_Custom_10` on EventCode 22; the recording is
+    `mx_Custom_4`.** Neither is documented and neither appears on most calls — coverage is
+    **31.6%** of disqualifying calls, and transcribed calls skew *connected* (99.6% vs 84.4%)
+    and slightly longer. So any transcript study is a study of the transcribed slice, not of
+    calling. Find fields like this by dumping every `ActivityFields` property and every
+    `Data[]` pair across every event code on a sample — not by probing names.
+40. **EventCode 3002 carries `PreviousStage` / `CurrentStage` / `CreatedBy` in `Data[]`** and
+    is present on every contact's trail. That makes stage history **trail-derivable for the
+    whole book**, where `v_stage_history` in the warehouse is only reliable from 1 Aug (it is
+    webhook-fed). Use the trail when the population predates the webhook cutover; same family
+    as gotcha 33.
+41. **Analysing calls TO contacts that are now disqualified is NOT analysing the call that
+    disqualified them.** A 3 July call on a contact disqualified 8 August says nothing about
+    the 8 August decision. The first pass at this cost a whole analysis and a published
+    conclusion: it read 299 transcripts that way and reported "28% ended with no decision".
+    Tie the call to the decision — take the last call at or before the stage-change timestamp
+    (a 2-hour grace window absorbs reps who log the call just after clicking) — or the finding
+    is about call endings in general, not about disqualification.
+42. **Excel COM cannot carry a workbook of this size.** 10 sheets / ~9,400 rows threw
+    `OutOfMemoryException` at the same sheet on every run, with screen updating off, manual
+    calculation, chunked writes and header-only AutoFilter. **Use `scripts/lib/xlsx.ps1`**,
+    which writes the OpenXML package directly — no Excel, no modules, no ceiling, and it
+    finishes instantly. `export-distribution-xlsx.ps1` still uses COM and still works, because
+    it writes four small sheets.
+43. **PowerShell parses a comma inside an index expression BEFORE the arithmetic.**
+    `$grid[$i + 1, $j]` is `$i + (1, $j)` and throws `op_Addition` on `Object[]` — assign the
+    row index to a variable first. Related: a leading comma inside a method call
+    (`$list.Add(,@(...))`) is a parse error; it is only an array-wrapping operator in pipeline
+    output.
+44. **`Get-Content` defaults to ANSI on PowerShell 5.1**, so reading a UTF-8 file turns every
+    Devanagari character into mojibake (`à¤¹à¤¾à¤`) — which then triples its token cost and
+    silently corrupts any downstream write. Read through
+    `[IO.File]::ReadAllText($path, (New-Object Text.UTF8Encoding($false)))`. And keep the
+    non-ASCII *out of the `.ps1` itself* (hard rule 6) — put Hindi search patterns in a JSON
+    data file the script reads at runtime.
 
 Plus: **no bulk Opportunity read endpoint and no bulk Activity read endpoint exist** — both cost
 one API call per lead, so always narrow to a candidate set first. **No Notes API exists** either.
