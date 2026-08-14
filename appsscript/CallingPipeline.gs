@@ -72,7 +72,7 @@ var TAB_COLOR = {
 // Bumped on every code change. diagnose() and the Meta tab both print it, which is the only
 // reliable way to tell "my paste did not take effect" apart from "the code ran and did
 // nothing" - two failures that look identical from the Sheet.
-var CODE_VERSION = '2026-08-11.5-split-bundle';
+var CODE_VERSION = '2026-08-12.1-unnest-icp-fetch';
 
 var IST_OFFSET_MS = 330 * 60 * 1000;
 
@@ -849,48 +849,73 @@ function refreshReports() {
     var B = sbBundle_(HISTORY_FROM);
     fetches++;
 
-    // Second bundle: rep ordering, channels, book health, and the new QC families.
+    // Second bundle: rep ordering, channels and book health. The QC and non-owner key sets
+    // it used to carry were removed in migration 031 - nothing rendered them, and they were
+    // 4.85s of an 8.62s bundle against an 8s statement timeout.
     // Merged into B so every writer keeps taking a single object. Failure here must NOT
     // take the refresh down - the tabs that predate it have to keep rendering, which is the
     // same reason each tab below is individually try/caught.
     try {
       var C = sbChannelBundle_(HISTORY_FROM);
       fetches++;
-      var merged = 0;
-      for (var ck in C) { if (C.hasOwnProperty(ck)) { B[ck] = C[ck]; merged++; } }
-
-      // The ICP and disqualification datasets live in a SECOND function. Splitting them was
-      // not tidiness: every view is individually fast, but as ONE statement they exceeded the
-      // statement timeout and the whole bundle 500'd, blanking four tabs at once. Fetched
-      // separately so a slow half cannot take the other half down with it.
-      try {
-        var D = sbIcpBundle_(HISTORY_FROM);
-        fetches++;
-        for (var dk in D) { if (D.hasOwnProperty(dk)) { B[dk] = D[dk]; merged++; } }
-      } catch (eI) {
-        failures.push('icp_bundle (migration 028 applied?): ' + eI);
-      }
+      var mergedC = 0;
+      for (var ck in C) { if (C.hasOwnProperty(ck)) { B[ck] = C[ck]; mergedC++; } }
 
       // Report what arrived, not just that the call returned 200. An empty tab has two very
       // different causes - the fetch failed, or it succeeded and the dataset is genuinely
       // empty - and they need opposite fixes. Without this line both look identical on the
       // Sheet, which is exactly the "silence reads as zero" failure this project keeps
       // hitting. The counts land on Meta.
+      //
+      // Only keys channel_bundle actually returns are checked here. icp_funnel and
+      // disq_by_rep moved to icp_bundle in 028, so looking for them in C reported ABSENT
+      // on every healthy run and blamed migration 024 - a false alarm pointing at the
+      // wrong file. They are checked below, against the bundle that now owns them.
       var sizes = [];
-      var want = ['channel_day', 'book_health', 'icp_funnel', 'disq_by_rep', 'rep_order'];
+      var want = ['channel_day', 'book_health', 'rep_order', 'channel_mix'];
       for (var wi = 0; wi < want.length; wi++) {
         var v = C[want[wi]];
         sizes.push(want[wi] + '=' + (v === undefined ? 'ABSENT' : (v.length || 0)));
       }
-      Logger.log('channel_bundle merged ' + merged + ' keys: ' + sizes.join(' '));
+      Logger.log('channel_bundle merged ' + mergedC + ' keys: ' + sizes.join(' '));
       if (!C.channel_day || !C.channel_day.length) {
         failures.push('channel_bundle returned no channel_day (' + sizes.join(' ') + ')');
       }
-      if (C.icp_funnel === undefined) {
-        failures.push('channel_bundle has no icp_funnel key - migration 024 not applied');
-      }
     } catch (e0) {
-      failures.push('channel_bundle FETCH FAILED (migrations 021/024 applied?): ' + e0);
+      failures.push('channel_bundle FETCH FAILED (migrations 021/028 applied?): ' + e0);
+    }
+
+    // The ICP and disqualification datasets live in a SECOND function. Splitting them was
+    // not tidiness: every view is individually fast, but as ONE statement they exceeded the
+    // statement timeout and the whole bundle 500'd, blanking four tabs at once.
+    //
+    // This fetch is a SIBLING of the channel bundle above, deliberately not nested inside
+    // its try. It was nested until 2026-08-12, which silently undid the whole point of the
+    // split: channel_bundle throwing on timeout jumped straight to its catch, so this line
+    // never ran at all and the ICP and Disqualified tabs went blank for a reason that had
+    // nothing to do with them or their data. Splitting the SQL is only half the isolation -
+    // the fetches have to be independent too.
+    try {
+      var D = sbIcpBundle_(HISTORY_FROM);
+      fetches++;
+      var mergedD = 0;
+      for (var dk in D) { if (D.hasOwnProperty(dk)) { B[dk] = D[dk]; mergedD++; } }
+
+      var iSizes = [];
+      var iWant = ['icp_funnel', 'icp_scorecard', 'disq_by_rep', 'disq_reasons'];
+      for (var ii = 0; ii < iWant.length; ii++) {
+        var iv = D[iWant[ii]];
+        iSizes.push(iWant[ii] + '=' + (iv === undefined ? 'ABSENT' : (iv.length || 0)));
+      }
+      Logger.log('icp_bundle merged ' + mergedD + ' keys: ' + iSizes.join(' '));
+      if (D.icp_funnel === undefined) {
+        failures.push('icp_bundle has no icp_funnel key - migration 023/024 not applied');
+      }
+      if (D.disq_by_rep === undefined) {
+        failures.push('icp_bundle has no disq_by_rep key - migration 022 not applied');
+      }
+    } catch (eI) {
+      failures.push('icp_bundle FETCH FAILED (migration 028 applied?): ' + eI);
     }
 
     var tabs = [
