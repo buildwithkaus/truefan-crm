@@ -25,6 +25,8 @@ param([int]$ThrottleMs = 300)
 
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\..\lib\common.ps1"
+. "$PSScriptRoot\..\lib\schema.ps1"
+. "$PSScriptRoot\..\lib\opportunity.ps1"
 . "$PSScriptRoot\sync-rules.ps1"
 
 $dataDir = Join-Path $PSScriptRoot "..\..\data"
@@ -107,20 +109,28 @@ foreach ($l in ($leads | Where-Object { $_.ProspectStage -eq "Disqualified" })) 
 $dealContacts = @($leads | Where-Object { $_.ProspectStage -in @("Prospect", "Customer") })
 Write-LsqLog "Checking opportunities for $($dealContacts.Count) deal-stage contacts..." $logPath
 foreach ($l in $dealContacts) {
-    $url = "$base/OpportunityManagement.svc/GetOpportunitiesOfLead?accessKey=$ak&secretKey=$sk&leadId=$($l.ProspectID)&opportunityType=12000"
     try {
-        $r = Invoke-RestMethod -Uri $url -Method Post -ContentType "application/json"
-        if ($r.RecordCount -eq 0) {
+        # V4 was dead until 2026-08-14: this read walked $o.Fields, which
+        # GetOpportunitiesOfLead does not return (gotcha 45), so Status and Stage were always
+        # null, Get-ContactStageFromOpportunity always returned $null, and the check silently
+        # passed on every contact. The helper reads the FLAT properties this endpoint sends.
+        $opps = @(Get-LsqOpportunitiesOfLead -ProspectId $l.ProspectID -Config $cfg)
+        if ($opps.Count -eq 0) {
             Add-Violation "V1" "HIGH" $l.ProspectID "Contact at '$($l.ProspectStage)' has NO Opportunity"
         } else {
-            $f = @{}
-            foreach ($fld in $r.List[0].Fields) { $f[$fld.SchemaName] = $fld.Value }
-            $expected = Get-ContactStageFromOpportunity -OppStatus $f["Status"] -OppStage $f["mx_Custom_2"]
-            if ($null -ne $expected -and $expected -ne $l.ProspectStage) {
-                Add-Violation "V4" "MEDIUM" $l.ProspectID "Contact '$($l.ProspectStage)' but opportunity is $($f['Status'])/$($f['mx_Custom_2']) (expected contact '$expected')"
+            # Judge the account on its furthest-advanced deal, not on whichever the API listed
+            # first - ordering is not guaranteed and a duplicate would otherwise decide V4.
+            $lead = $opps[0]
+            if ($opps.Count -gt 1) {
+                $ranked = $opps | Sort-Object @{ Expression = { $r = Get-LsqOpportunityStageRank $_.OppStage; if ($null -eq $r) { -1 } else { $r } } } -Descending
+                $lead = $ranked[0]
             }
-            if ($r.RecordCount -gt 1) {
-                Add-Violation "V3" "HIGH" $l.ProspectID "Lead has $($r.RecordCount) opportunities - should be 1"
+            $expected = Get-ContactStageFromOpportunity -OppStatus $lead.Status -OppStage $lead.OppStage
+            if ($null -ne $expected -and $expected -ne $l.ProspectStage) {
+                Add-Violation "V4" "MEDIUM" $l.ProspectID "Contact '$($l.ProspectStage)' but opportunity is $($lead.Status)/$($lead.OppStage) (expected contact '$expected')"
+            }
+            if ($opps.Count -gt 1) {
+                Add-Violation "V3" "HIGH" $l.ProspectID "Lead has $($opps.Count) opportunities - should be 1 [$(($opps | ForEach-Object { $_.OppStage }) -join ', ')]"
             }
         }
     } catch {

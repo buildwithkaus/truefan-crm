@@ -164,9 +164,9 @@ Write-LsqLog "--- C. Candidate sizing (the real API budget) ---" $logPath
 
 # Negative control FIRST. A filter that silently returns everything, or silently returns
 # nothing, must be caught here rather than believed downstream.
-$negRows = Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{
+$negRows = @(Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{
     LookupName = "ProspectActivityName_Max"; LookupValue = "ZZ_NoSuchActivity_ZZ"; SqlOperator = "="
-} -ColumnsCsv "ProspectID" -PageSize 100 -SortColumn "CreatedOn")
+} -ColumnsCsv "ProspectID" -PageSize 100 -SortColumn "CreatedOn"))
 Write-LsqLog "  negative control (bogus activity name): $($negRows.Count) rows -- must be 0" $logPath
 if ($negRows.Count -ne 0) { throw "NEGATIVE CONTROL FAILED - ProspectActivityName_Max filter is being ignored." }
 
@@ -176,9 +176,9 @@ $cols = "ProspectID,OwnerId,OwnerIdName,ProspectStage,ProspectActivityDate_Max,P
 $candidates = New-Object System.Collections.Generic.List[object]
 $page = 1
 while ($true) {
-    $rows = Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{
+    $rows = @(Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{
         LookupName = "ProspectActivityDate_Max"; LookupValue = $dayStart; SqlOperator = ">"
-    } -ColumnsCsv $cols -PageIndex $page -PageSize 1000 -SortColumn "CreatedOn")
+    } -ColumnsCsv $cols -PageIndex $page -PageSize 1000 -SortColumn "CreatedOn"))
     if ($rows.Count -eq 0) { break }
     foreach ($r in $rows) { [void]$candidates.Add($r) }
     if ($rows.Count -lt 1000) { break }

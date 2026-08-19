@@ -32,6 +32,27 @@ function Get-LsqUrl {
 #   Query.CompanyType, Query.SearchText, Query.DateRange all verified working).
 #   ALWAYS verify a new filter combination with a negative-control test (a value that should
 #   return zero rows) before trusting it - especially before any write/update operation.
+
+# LookupName is CASE-SENSITIVE, and a wrong case returns ZERO ROWS WITH NO ERROR.
+# Verified live 2026-08-14 on an established lead: LookupName="ProspectId" -> 0 rows,
+# LookupName="ProspectID" -> 1 row. This is the gotcha-2 failure mode - a filter that returns
+# nothing and reads as fact. It is especially dangerous inside a safety guard: a post-write
+# check that re-reads the lead to assert "the stage did not move" finds no lead at all and
+# reports a confident pass.
+#
+# Canonical spellings. A LookupName that matches one of these case-INSENSITIVELY but not
+# EXACTLY is the bug: it will return zero rows and no error. Throwing beats auto-correcting -
+# there is no valid field called ProspectId, so a caller using it has a bug worth surfacing.
+#
+# Note this cannot be a hashtable keyed on the wrong spellings: PowerShell hash literals are
+# case-insensitive, so "ProspectId"/"prospectId" collide into a DuplicateKeyInHashLiteral parse
+# error - which, in a file dot-sourced by ~40 scripts, breaks all of them at once. Comparison
+# has to be explicitly case-sensitive (-cne), because plain -ne is case-insensitive too.
+$Script:LsqCanonicalLookupNames = @(
+    "ProspectID", "EmailAddress", "ProspectStage", "OwnerId", "RelatedCompanyId",
+    "ProspectActivityDate_Max", "ProspectActivityName_Max", "IsPrimaryContact", "ModifiedOn"
+)
+
 function Invoke-LsqLeadSearch {
     param(
         [Parameter(Mandatory)][hashtable]$Filter,   # @{ LookupName=...; LookupValue=...; SqlOperator=... }
@@ -41,6 +62,14 @@ function Invoke-LsqLeadSearch {
         [string]$SortColumn = "ProspectActivityDate_Max",
         [string]$SortDirection = "1"
     )
+    $ln = "$($Filter['LookupName'])"
+    if ($ln) {
+        foreach ($canon in $Script:LsqCanonicalLookupNames) {
+            if ($ln -ieq $canon -and $ln -cne $canon) {
+                throw "LookupName '$ln' differs from '$canon' only by case. LeadSquared lookup names are CASE-SENSITIVE and a wrong case returns ZERO ROWS WITH NO ERROR - use '$canon'."
+            }
+        }
+    }
     $url = Get-LsqUrl "LeadManagement.svc/Leads.Get"
     $body = @{
         Parameter = $Filter
@@ -61,6 +90,17 @@ function Invoke-LsqLeadSearch {
 # a complete scan of the whole account after one page. This is the same silent-undercount
 # failure family as the "Invalid/ Junk" bug - it looks like an empty account, not an error.
 # Always unwrap a page through this before counting or iterating it.
+#
+# DO NOT ADD A LEADING COMMA TO THE RETURN. `return ,$out.ToArray()` suppresses the unrolling
+# that `@(...)` depends on, so `@(Expand-LsqRows ...)` reads Count = 1 for a 0-row page, a 1-row
+# page AND a 1000-row page, with [0] holding the whole inner array. That reintroduces exactly the
+# silent-truncation bug this function exists to prevent, at all 78 wrapped call sites.
+# Measured 2026-08-14: with the comma, 0/1/3-row pages all reported 1.
+#
+# The single-row concern that motivated the comma is real but belongs at the CALL SITE: a bare
+# `$rows = Expand-LsqRows ...` hands back a lone PSCustomObject for a one-row page, and a bare
+# PSCustomObject has no .Count in 5.1 (it reads as empty string, not 1). The fix is to wrap in
+# `@(...)` like every other caller, not to change the contract underneath them.
 function Expand-LsqRows {
     param([AllowNull()]$Response)
     $out = New-Object System.Collections.Generic.List[object]
@@ -205,4 +245,51 @@ function Invoke-LsqCompanySearch {
     return Invoke-LsqWithRetry -What "Company.Get page $PageIndex" -Action {
         Invoke-RestMethod -Uri $url -Method Post -Body $body -ContentType "application/json" -ErrorAction Stop
     }
+}
+
+
+# Write one or more fields on a single Lead. THIS IS THE SHAPE THAT ACTUALLY WORKS.
+#
+#   POST LeadManagement.svc/Lead.Update?accessKey=&secretKey=&leadId=<guid>
+#   body: [ {"Attribute":"ProspectStage","Value":"Prospect"} ]        <- a JSON ARRAY
+#   ok:   {"Status":"Success","Message":{"AffectedRows":1}}
+#
+# Proven live 2026-08-19, in both directions (Engaged -> Prospect -> Engaged).
+#
+# TWO TRAPS, BOTH HIT BEFORE THIS HELPER EXISTED:
+#
+# 1. Lead/Bulk/UpdateV2 with `LeadPropertiesList = @(, @(@{ Fields = @(...) }))` - the shape
+#    sync-engine.ps1 has carried since it was written - is WRONG. It sends an array of arrays,
+#    and the API answers HTTP 400: "Cannot deserialize the current JSON array into type
+#    'LeadFieldKeyValuePair' because the type requires a JSON object". That script has never
+#    successfully written a contact stage; the bug survived because the engine was never run.
+#    Sending LeadPropertiesList as a flat Attribute/Value list instead returns HTTP 200 with
+#    SuccessCount 0 and "Fields cannot be empty" - a 200 that changed nothing, which is worse.
+#
+# 2. The body MUST serialise as a JSON array even for one field. `@(@{...}) | ConvertTo-Json`
+#    collapses a single-element array to a bare object (gotcha 12, and it DOES bite at the top
+#    level of a pipeline), producing 400: "Cannot deserialize the current JSON object into type
+#    List<LeadProperty>". The array is built as text here so that cannot happen.
+#
+# Does NOT verify. LeadSquared returns 200 for writes that change nothing, so every caller must
+# re-fetch and assert (gotcha 49 family).
+function Set-LsqLeadFields {
+    param(
+        [Parameter(Mandatory)][string]$ProspectId,
+        [Parameter(Mandatory)][hashtable]$Fields      # @{ ProspectStage = 'Prospect' }
+    )
+    if ($Fields.Count -eq 0) { throw "Set-LsqLeadFields called with no fields for $ProspectId." }
+    $parts = @()
+    foreach ($k in $Fields.Keys) {
+        $attr = ([string]$k) -replace '"','\"'
+        $val  = ([string]$Fields[$k]) -replace '"','\"'
+        $parts += '{"Attribute":"' + $attr + '","Value":"' + $val + '"}'
+    }
+    $body = '[' + ($parts -join ',') + ']'
+    $url  = Get-LsqUrl "LeadManagement.svc/Lead.Update"
+    $r = Invoke-LsqPost -Uri "$url&leadId=$ProspectId" -JsonBody $body
+    if ("$($r.Status)" -ne "Success") {
+        throw "Lead $ProspectId field update FAILED -> $($r | ConvertTo-Json -Compress -Depth 4)"
+    }
+    return $r
 }

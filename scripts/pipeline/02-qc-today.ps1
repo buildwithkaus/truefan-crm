@@ -64,9 +64,9 @@ Write-LsqLog "Cutover  : $CutoverIst IST = $($cutoverUtc.ToString('yyyy-MM-dd HH
 Write-LsqLog "" $logPath
 Write-LsqLog "--- 0. Leads.GetById smoke test (enrichment depends on it) ---" $logPath
 
-$probe = Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{
+$probe = @(Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{
     LookupName = "ProspectActivityDate_Max"; LookupValue = (Get-LsqTimestamp ((Get-Date).AddDays(-2))); SqlOperator = ">"
-} -ColumnsCsv "ProspectID,OwnerIdName" -PageSize 1 -SortColumn "CreatedOn")
+} -ColumnsCsv "ProspectID,OwnerIdName" -PageSize 1 -SortColumn "CreatedOn"))
 
 if ($probe.Count -eq 0) {
     Write-LsqLog "  could not find a lead to probe with - skipping" $logPath

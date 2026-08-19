@@ -54,6 +54,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\..\lib\common.ps1"
+. "$PSScriptRoot\..\lib\schema.ps1"
+. "$PSScriptRoot\..\lib\opportunity.ps1"
 
 $dataDir = Join-Path $PSScriptRoot "..\..\data"
 $logPath = Join-Path $dataDir "automation_test_log.txt"
@@ -87,7 +89,10 @@ function Assert-State {
 
 function Get-LeadStage {
     param([string]$LeadId)
-    $r = Invoke-LsqLeadSearch -Filter @{ LookupName="ProspectId"; LookupValue=$LeadId; SqlOperator="=" } `
+    # ProspectID, not ProspectId. The wrong case returned zero rows with no error, so this
+    # returned $null for every lead and EVERY assertion in this harness compared against null -
+    # the automation test could not have detected a failure. Fixed 2026-08-14, gotcha 49.
+    $r = Invoke-LsqLeadSearch -Filter @{ LookupName="ProspectID"; LookupValue=$LeadId; SqlOperator="=" } `
         -ColumnsCsv "ProspectID,ProspectStage,RelatedCompanyId,IsPrimaryContact" -PageIndex 1 -PageSize 1
     if (-not $r -or @($r).Count -eq 0) { return $null }
     return $r[0]
@@ -102,19 +107,21 @@ function Get-CompanyStage {
 }
 
 function Get-LeadOpportunities {
+    <#
+      Had two bugs until 2026-08-14, both of which made this test report success wrongly:
+
+        1. It walked $o.Fields, which GetOpportunitiesOfLead does not return (gotcha 45), so
+           Status and Stage were null on every deal - and this script's assertions are about
+           Status and Stage.
+        2. catch { return @() } turned a transport failure into "this lead has no deals",
+           which in an automation test reads as "the automation did not fire".
+
+      Throws now. A test harness that cannot tell "no deal" from "the read failed" cannot
+      test anything.
+    #>
     param([string]$LeadId)
-    $url = "$base/OpportunityManagement.svc/GetOpportunitiesOfLead?accessKey=$ak&secretKey=$sk&leadId=$LeadId&opportunityType=12000"
-    try {
-        $r = Invoke-RestMethod -Uri $url -Method Post -ContentType "application/json"
-        if ($r.RecordCount -eq 0) { return @() }
-        $out = @()
-        foreach ($o in $r.List) {
-            $f = @{}
-            foreach ($fld in $o.Fields) { $f[$fld.SchemaName] = $fld.Value }
-            $out += [pscustomobject]@{ Id=$o.OpportunityId; Status=$f["Status"]; Stage=$f["mx_Custom_2"] }
-        }
-        return $out
-    } catch { return @() }
+    return Get-LsqOpportunitiesOfLead -ProspectId $LeadId -Config $cfg |
+        ForEach-Object { [pscustomobject]@{ Id = $_.OpportunityId; Status = $_.Status; Stage = $_.OppStage } }
 }
 
 function Wait-For {

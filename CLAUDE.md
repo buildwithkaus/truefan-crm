@@ -269,6 +269,87 @@ new script. One line each:
     `[IO.File]::ReadAllText($path, (New-Object Text.UTF8Encoding($false)))`. And keep the
     non-ASCII *out of the `.ps1` itself* (hard rule 6) — put Hindi search patterns in a JSON
     data file the script reads at runtime.
+45. **`GetOpportunitiesOfLead` returns FLAT properties — it has no `Fields[]` array.** Only
+    `GetOpportunityDetails` does. Five scripts walked `foreach ($fld in $o.Fields)` against the
+    flat endpoint: the loop never runs, every value reads `$null`, and nothing throws. It made
+    `03-backup.ps1` write a **structurally empty opportunity backup** (null Status/Stage/Name on
+    every row, with a healthy row count in the log) and silently killed
+    `validate-consistency.ps1`'s V4 drift check. Same family as gotcha 24. Use
+    `scripts/lib/opportunity.ps1`. And never `catch { return @() }` around an opportunity read —
+    that turns a network error into "this lead has no deals", which in a create path makes a
+    duplicate deal that **cannot be deleted**.
+46. **The Opportunity stage rank table must include `Requirement Gathering`.** It was missing
+    until 2026-08-14, so `$Script:OpportunityStageRank['Requirement Gathering']` returned `$null`
+    — and PowerShell evaluates `$null -lt 1` as `$true`, so the *warm* deal lost every
+    "keep the furthest advanced" duplicate contest to a brand-new one. Compare ranks only via
+    `Get-LsqOpportunityStageRank`, which returns `$null` plus a warning for an unknown value
+    rather than a silent 0. `schema.ps1` and `opp_stage_rank()` in migration 012 must agree.
+    Related: **do not re-run `06b-fix-legacy-opportunity-stages.ps1`** — its mapping rewrites
+    `Requirement Gathering` -> `Prospect`, which was right in July and would now demote ~90 live
+    warm deals with no undo. It is gated behind a switch as of 2026-08-14.
+47. **Opportunities CAN be deleted. The repo said otherwise for two weeks because the delete
+    parameter is `Id`, not `opportunityId`.** Every other opportunity endpoint keys on
+    `opportunityId`, so the natural guess is wrong — and the wrong name does not error, it just
+    fails, which reads as "deletion is blocked at the object level". `CanDelete: false` in
+    `docs/AUTOMATION_CAPABILITIES.md` is **wrong**: the live type reports `CanDelete=True` and a
+    delete was proven end-to-end on 2026-08-14. Contract:
+    `GET OpportunityManagement.svc/Delete?accessKey=&secretKey=&Id=<guid>` ->
+    `{"Status":"Success","Message":{"IsSuccessful":true}}`. Rate limit 25 calls / 5 s, so space
+    bulk deletes at >= 200 ms. Also: `GetOpportunityTypes` returns a **bare array** (not `.List`)
+    keyed on **`EventCode`** (not `OpportunityEventCode`) — parsing it wrong yields an empty
+    `CanDelete` that then reads as "blocked" and confirms whatever you already believed. Use
+    `Remove-LsqOpportunity`. **Deletion is irreversible — back up all 29 fields via
+    `GetOpportunityDetails` first.**
+48. **`GetOpportunitiesOfLead` LAGS and will report 0 deals for a lead that demonstrably has
+    one.** Verified live 2026-08-14: a deal created minutes earlier was fully readable via
+    `GetOpportunityDetails` (29 fields) and present on the activity trail, while
+    `GetOpportunitiesOfLead` returned 0 for its lead — it is index-backed. Never use it alone as
+    the existence check before a create: that is exactly how a duplicate deal gets made on an
+    account that already had one. Cross-check the **activity trail (EventCode 12000)**, which is
+    authoritative and immediate — `New-LsqOpportunity` now does. Related: a **deleted**
+    opportunity's detail read returns **HTTP 500, not 404**, and 500 is classified transient, so
+    a retry-wrapped read burns ~14 s per deleted record. `Confirm-LsqOpportunityRemoved` issues a
+    single unwrapped request for that reason.
+49. **`LookupName` is CASE-SENSITIVE and a wrong case returns ZERO ROWS WITH NO ERROR.**
+    `LookupName="ProspectId"` -> 0 rows; `"ProspectID"` -> 1 row (verified live 2026-08-14 on an
+    established lead). Same failure family as gotcha 2 — a filter that matches nothing and reads
+    as fact — and worst inside a *safety guard*: a post-write check that re-reads the lead to
+    assert "the contact stage did not move" finds no lead at all and reports a confident pass.
+    `test-automations-live.ps1` used the wrong case, so every assertion in that harness had been
+    comparing against `$null`. `Invoke-LsqLeadSearch` now throws on a case-only mismatch. Note the
+    guard **cannot** be a hashtable keyed on the wrong spellings — PowerShell hash literals are
+    case-insensitive, so `"ProspectId"`/`"prospectId"` collide into `DuplicateKeyInHashLiteral`,
+    which breaks every script dot-sourcing `common.ps1`. Compare with `-cne`; plain `-ne` is
+    case-insensitive too.
+50. **`powershell.exe` launched from Git Bash is blocked by execution policy — and the wrapper
+    still exits 0.** A loop of `powershell.exe -File script.ps1` run through the Bash tool
+    printed its own "ALL DONE" banner and returned success while every invocation had actually
+    failed with `UnauthorizedAccess`. Zero of 1,127 intended deletes happened, and nothing in
+    the exit code said so. The PowerShell tool runs at `Bypass` **process** scope; a shell
+    launched outside it inherits the machine default. Always pass
+    `-NoProfile -ExecutionPolicy Bypass -File ...`, and **verify the work from the script's own
+    log or checkpoint, never from the wrapper's exit code**. Exactly the family gotcha 31 warns
+    about.
+51. **The opportunity API rate limit is 25 calls / 5 seconds, and backup-then-delete costs TWO
+    calls per record.** At `-ThrottleMs 250` that is ~40 calls per 5s and the run earns a
+    steady stream of HTTP 429s. `Invoke-LsqWithRetry` absorbs them, so the run completes and
+    looks clean — it is just slower than it appears. Budget ~400ms per record for any
+    read-then-write loop.
+52. **`sync-engine.ps1` has never been able to write a contact stage, and the failure is
+    invisible two different ways.** Its `Lead/Bulk/UpdateV2` body builds
+    `LeadPropertiesList = @(, @(@{ Fields = @(...) }))`, which serialises as an array **of
+    arrays**. The API answers HTTP 400: *"Cannot deserialize the current JSON array into type
+    'LeadFieldKeyValuePair'"*. Flattening it to a plain Attribute/Value list is worse — that
+    returns **HTTP 200 with `SuccessCount: 0`** and `"Fields cannot be empty"`, a success
+    response that changed nothing. The bug survived because the engine was never actually run.
+    The shape that works, proven live 2026-08-19 in both directions:
+    `POST LeadManagement.svc/Lead.Update?...&leadId=<guid>` with body
+    `[{"Attribute":"ProspectStage","Value":"Prospect"}]` -> `{"Status":"Success","Message":{"AffectedRows":1}}`.
+    The body **must** serialise as a JSON array even for one field — `@(@{...}) | ConvertTo-Json`
+    collapses it to an object (gotcha 12 bites at the top level of a pipeline) and 400s. Use
+    `Set-LsqLeadFields` in `common.ps1`. And note the lead index **lags a few seconds behind the
+    write**: a one-shot read-back reported 14 successful writes as failures, which then went
+    unrecorded in the rollback file. Poll for ~25 s before calling a contact write failed.
 
 Plus: **no bulk Opportunity read endpoint and no bulk Activity read endpoint exist** — both cost
 one API call per lead, so always narrow to a candidate set first. **No Notes API exists** either.

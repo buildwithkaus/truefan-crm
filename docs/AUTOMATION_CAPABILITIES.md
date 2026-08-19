@@ -173,7 +173,7 @@ Genuinely not automatable. Everything else is scripted.
 | Make activity fields mandatory | Activity type config is UI-only | **After** rep briefing |
 | Make Company Stage read-only for reps | Permissions are UI-only | After briefing |
 | Schedule the sync engine | One Task Scheduler entry (command below) | After migration |
-| Delete any duplicate Opportunity | `CanDelete: false` on the Opportunity Type blocks API deletion | As needed |
+| ~~Delete any duplicate Opportunity~~ | ~~`CanDelete: false` on the Opportunity Type blocks API deletion~~ **WRONG - corrected 2026-08-14.** The live type reports `CanDelete=True` and deletion was proven end-to-end. The delete parameter is `Id`, not `opportunityId`, which is almost certainly why it was recorded as blocked. Use `Remove-LsqOpportunity` (`scripts/lib/opportunity.ps1`), not the UI. See gotcha 47. | Scriptable |
 
 Roughly **45 minutes of UI work**, all of it in `MANUAL_STEPS.md` with a checklist.
 

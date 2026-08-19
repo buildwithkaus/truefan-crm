@@ -67,9 +67,9 @@ Write-LsqLog "IST day $TargetDate = UTC window [$($dayStartUtc.ToString('yyyy-MM
 # ---------------------------------------------------------------------------------------
 # SIDE A - count straight from LeadSquared.
 # ---------------------------------------------------------------------------------------
-$negRows = Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{
+$negRows = @(Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{
     LookupName = "ProspectActivityDate_Max"; LookupValue = "2099-01-01 00:00:00"; SqlOperator = ">"
-} -ColumnsCsv "ProspectID" -PageSize 10 -SortColumn "CreatedOn")
+} -ColumnsCsv "ProspectID" -PageSize 10 -SortColumn "CreatedOn"))
 Write-LsqLog "Negative control: $($negRows.Count) rows -- must be 0" $logPath
 if ($negRows.Count -ne 0) { throw "NEGATIVE CONTROL FAILED - filter ignored, results untrustworthy." }
 
@@ -82,9 +82,9 @@ $cols = "ProspectID,OwnerId,OwnerIdName,ProspectActivityDate_Max,ProspectActivit
 $list = New-Object System.Collections.Generic.List[object]
 $page = 1
 while ($true) {
-    $rows = Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{
+    $rows = @(Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{
         LookupName = "ProspectActivityDate_Max"; LookupValue = $since; SqlOperator = ">"
-    } -ColumnsCsv $cols -PageIndex $page -PageSize 1000 -SortColumn "CreatedOn")
+    } -ColumnsCsv $cols -PageIndex $page -PageSize 1000 -SortColumn "CreatedOn"))
     if ($rows.Count -eq 0) { break }
     foreach ($r in $rows) { [void]$list.Add($r) }
     if ($rows.Count -lt 1000) { break }

@@ -682,37 +682,146 @@ they left in 028, so it reported ABSENT on every healthy run and blamed the wron
 Full findings: **`memory/14-disqualification-analysis.md`**. Report artifact published; two
 workbooks in `data/`.
 
-Answered the standing question behind Phase 9 and 11: 67.6% of the book is Disqualified and 42%
-of that says `Not Interested - No Reason Stated` — what is actually going on?
+## Phase 13 — Sort the Opportunity tab (2026-08-14 to 08-19) — **cleanup executed; warehouse reconciled**
 
-**The reason field is not diagnosis.** 96.7% of disqualifications carry a reason that is a
-rename of the legacy `ProspectStage` the contact already held, proven from
-`mx_Previous_Contact_Stage`. "98% have a reason" measures the migration, not the sales team.
+**Goal.** An Opportunity tab that can be forecast from: every open deal carries an Expected Deal
+Size and an Expected Closure Date, sits on a contact at `Prospect`, and belongs to one rep.
+Won and contracted deals are preserved untouched as the record of closed business.
 
-**Reps are not the problem.** Across all 1,520 contacts a *named rep* disqualified 1–13 Aug
-(bulk and admin writes excluded): **4.92 calls** on average beforehand, 92.8% connected first,
-88.6% disqualified straight after a connected call and 93.8% within the hour. An earlier
-"1.38 calls" figure was wrong — it counted only the warehouse window, not full history.
+### What the tab looked like, and what it looks like now
 
-**200 disqualifying calls read in full** (the one-connected-call, `No Reason Stated`, transcribed
-cohort): 48% genuinely produced no obtainable reason, 23.5% should never have been dialled,
-11% gave a real commercial reason, and **7% were lost by our own process** — an existing customer
-cold-called, a Prospect-stage partner dropped, opt-outs still being dialled, nine who asked for
-material and were marked Not Interested anyway. **Price appears 3 times in 200.**
+| | before | after |
+|---|---|---|
+| Opportunities live | 4,673 | ~615 |
+| Rows in `fact_opportunity` | 1,498 | reconciled to live |
+| Deals the warehouse could not see | ~3,200 | 0 |
+| Open deals with no forecast data | ~2,900 | 0 |
+| Deals ever marked Lost | 0 | 1 |
 
-**ICP enrichment bought reachability, not demand** — no industry, city or ads signal separates
-buyers anywhere in the book. **Lead quality is a channel problem**: 31% of FB Lead Ads and 48%
-of `Inbound Phone call` are marked "not a business", against 0.4% on the manual ICP list.
+Net: **4,088 opportunities deleted**, 105 contacts promoted `Engaged -> Prospect`, 67 deal owners
+realigned. Every deleted deal is on disk with all 29 fields in
+`data/opportunity_*deleted_*.json` and can be recreated by `99-restore-opportunities.ps1`
+(a recreate, not an undelete - new id, new creation date).
 
-Six gotchas came out of this and are in `CLAUDE.md` (39–44). The expensive one is **41**: the
-first pass analysed 299 calls *to* disqualified contacts as if each were the disqualifying call,
-which it was not, and published a conclusion that had to be withdrawn.
+### The deletions, by rule
 
-**Still open, all business decisions rather than engineering:** qualify the list before it
-reaches a rep (biggest lever, sits outside sales); put call history, stage and opt-out status on
-the dialler screen; add monthly ad spend as a qualifying field; make disposition + a one-line
-note mandatory on a connected call; make Closed-Lost real. **Do not** respond to this by pushing
-reps to dial more or disqualify less.
+1. **Structural, 1,128.** 812 deals whose contact had never reached a deal stage (verified from
+   the EventCode 3002 trail, not assumed), 200 on contacts that reached Prospect and lapsed,
+   116 duplicate losers.
+2. **Forecast-less, 2,960.** Open deals carrying neither Expected Deal Size nor Expected Closure
+   Date. Run boxed per rep first (Abhishek 57, Ashutosh 93, Rishi 4) to prove the shape, then
+   swept. Never touched: Won, Customer contacts, `Agreement Sent` or beyond, or anything with an
+   actual deal size, contract date, or agreement/invoice-sent date.
+
+**Contacts were never demoted or deleted.** The only contact writes in the whole phase were 105
+promotions of contacts that held a complete, forecasted deal but had never been moved off
+`Engaged` - INR 3.77 crore of pipeline that a Prospect-scoped forecast could not see. 90 of those
+belonged to one rep, which makes it a coaching problem, not a data problem.
+
+### Seven documented facts that turned out to be wrong
+
+1. **Opportunities CAN be deleted** (gotcha 47). `CanDelete: false` was recorded because the
+   delete parameter is `Id`, not `opportunityId`, and the wrong name fails silently.
+2. **`GetOpportunitiesOfLead` has no `Fields[]`** (gotcha 45). Five scripts walked it, so
+   `03-backup.ps1` wrote a structurally empty backup while logging a healthy row count.
+3. **`LookupName` is case-sensitive** (gotcha 49). `ProspectId` returns zero rows silently;
+   `test-automations-live.ps1` had been asserting against `$null` on every check.
+4. **`GetOpportunitiesOfLead` lags** (gotcha 48) and reports 0 deals for a lead that has one.
+5. **The rank table was missing `Requirement Gathering`** (gotcha 46), so `$null -lt 1` made the
+   warm deal lose every duplicate contest.
+6. **`sync-engine.ps1` cannot write a contact stage** (gotcha 52). Its `Lead/Bulk/UpdateV2` body
+   sends an array of arrays and returns HTTP 400; the flat shape returns 200 with
+   `SuccessCount: 0`. It has never worked. Use `Set-LsqLeadFields`.
+7. **`powershell.exe` from Git Bash is execution-policy blocked and the wrapper still exits 0**
+   (gotcha 50). A loop reported "ALL DONE" having performed zero of 1,127 deletes.
+
+### What was built
+
+```
+scripts/lib/opportunity.ps1                             shared read/write/delete/confirm helpers
+scripts/lib/common.ps1        + Set-LsqLeadFields       the contact write that actually works
+scripts/pipeline/13-probe-opportunity-writes.ps1        capability probes incl. -ProveDelete
+scripts/remediation/00-backup-opportunities.ps1         candidate union + book scan + backup
+scripts/remediation/04-resolve-ever-prospect.ps1        EventCode 3002 -> was this ever a deal
+scripts/remediation/06-delete-forecastless-and-demote.ps1   -RepName / -OnlyContactStage boxing
+scripts/remediation/07-promote-forecast-contacts.ps1    the mirror fix - promote, do not delete
+scripts/remediation/98-reconcile-warehouse.ps1          tombstone-guarded warehouse repair
+scripts/remediation/99-restore-opportunities.ps1        recreate deleted deals
+scripts/remediation/99-restore-contact-stages.ps1       undo a stage change
+scripts/reports/opportunity-hygiene-audit.ps1           classifier + reconciliation gate + xlsx
+scripts/reports/verify-opportunity-dropdown-coverage.ps1  closes the hard-rule-8 gap
+```
+
+Every writer is `-Execute`-gated, defaults to ONE record, proves the first write by independent
+re-fetch, and checkpoints only after confirmation.
+
+### Open, and needing a decision
+
+- **~800 contacts sit at `Prospect` holding no deal.** Direct consequence of deleting empty deals
+  while contact writes were forbidden: the emptiness moved from the deal record to the gap
+  between contact stage and pipeline. Options: demote them to Engaged, hand reps a worklist to
+  fill in value and date, or scope every forecast to deals rather than contact stage.
+- **2 Disqualified contacts hold a fully forecasted deal.** Left alone deliberately - promoting
+  them resurrects a contact someone wrote off.
+- 81 Prospect contacts are not the primary contact for their account, so a deal cannot be created
+  without fragmenting it; 13 more have no company name, which `mx_Custom_1` requires.
+- 100 Customer contacts have no deal at all - a hole in the record of closed business.
+- The forecast fields are still not mandatory in the UI. Nothing stops this refilling with empty
+  deals tomorrow; that is Phase 6 (automation) and Phase 7 (training).
+
+## Phase 14 — Per-rep book health (2026-08-14) — **pilot done for Abhishek Tripathi; 17 reps outstanding**
+
+**Goal.** One workbook per rep answering "how healthy is this book", five levels deep: stage /
+disposition / disqualification-reason splits, call coverage and staleness, prospects against
+their opportunities, the disqualified bucket, and the engaged bucket. Built by
+`scripts/reports/rep-book-health.ps1 -Rep "<name>"`, which reads the rep's **whole** book live
+rather than the enriched slice `v_book_health` sees.
+
+**The prerequisite that makes Level 2 real.** `fact_call` began 2026-08-01 — the day the webhook
+went live — so "never called" silently meant "not called this month". `backfill.ps1` now takes
+**`-OwnerId`** (its own negative control, its own checkpoint file, an assertion that every
+scanned row carries the owner asked for) and, paired with `-FromDate 2000-01-01`, loads a rep's
+lifetime history once. For Abhishek that took 1,844 API calls in 17 minutes and moved his
+owner-attributed call count from **1,864 to 6,418**, with history reaching back to 20 June. The
+August-only view was showing **29%** of his work.
+
+### What the pilot found
+
+| | |
+|---|---|
+| Book (live) | 1,869 — Engaged 882, Disqualified 806, Future Prospect 92, Prospect 55, Fresh 34 |
+| Never dialled by him | 48 (2.6%) |
+| Dialled exactly once | 840 (45%) |
+| Outbound lifetime / connected | 6,035 / 2,355 (39% connect rate) |
+| Calls on his book by **other** owners | 3,015 — inherited, excluded from every metric |
+| Prospects with an opportunity | 45 of 55; **26 now carry a deal size and closure date** |
+| Disqualified with no reason | 58 (7.2%) |
+| Disqualified he never connected with | 117 |
+
+Two findings worth acting on:
+
+1. **`Did Not Pick` is on 537 Engaged contacts, and 165 of them connected.** memory/11 §2 said
+   this happens; this is the per-rep number. A disposition asserting nobody answered, on a call
+   that did, is worse than a blank field.
+2. **224 contacts (12% of the book) carry a disposition no rep can filter** — `Not Interested -
+   No Reason Gauged` (185), `Requirement Gathering (Warm)` (22, a contact *stage* in the
+   disposition field), `Not Interested - Wrong Contact` (16), `Reached Voicemail` (1). Gotcha 10,
+   live in one book.
+
+**The warehouse snapshot is stale enough to matter.** `dim_contact_book` held 1,891 contacts for
+this rep with Fresh 194 / Prospect 72 / Disqualified 686; live is 34 / 55 / 806. The size check
+passes and the mix does not — so per-rep reporting must read the book live, and
+`12-load-contact-book.ps1` needs a refresh cadence.
+
+Also corrected here: `fact_opportunity` said **0 of 69** of his deals carried a deal size or
+closure date. Read live through `GetOpportunityDetails`, **26 of 45** do. The warehouse copy was
+loaded 2026-08-09 and reps have filled fields in since — which is exactly why Level 3 re-reads
+rather than trusting it.
+
+**Outstanding.** The other 17 reps: ~91,000 trail pulls ≈ 9 nights at the 10,000/day cap, biggest
+book first. Once a rep's history is loaded their workbook rebuilds at zero API cost.
+`dim_rep.team` / `team_lead` are unpopulated (mapping is in migration 013) and are needed before
+any cross-rep comparison sheet.
 
 ---
 

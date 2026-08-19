@@ -19,8 +19,11 @@
   Safe at any time - reads only. Takes a few minutes.
 #>
 
+$ErrorActionPreference = "Stop"
+
 . "$PSScriptRoot\..\lib\common.ps1"
 . "$PSScriptRoot\..\lib\schema.ps1"
+. "$PSScriptRoot\..\lib\opportunity.ps1"
 
 $dataDir = Join-Path $PSScriptRoot "..\..\data"
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -153,28 +156,41 @@ if (Test-Path $oppSourcePath) {
 }
 
 $cfg = Import-LsqConfig
-$base = $cfg['LSQ_API_HOST']; $ak = $cfg['LSQ_ACCESS_KEY']; $sk = $cfg['LSQ_SECRET_KEY']
+# Read through Get-LsqOpportunitiesOfLead. This block used to walk $o.Fields, which
+# GetOpportunitiesOfLead does not return - only GetOpportunityDetails does (gotcha 45). Every
+# Status/Stage/Name below was therefore null, so the backup this rollback depends on was
+# structurally empty while reporting a healthy row count. Fixed 2026-08-14.
+$oppReadFailures = @()
 foreach ($leadId in $candidates) {
-    $url = "$base/OpportunityManagement.svc/GetOpportunitiesOfLead?accessKey=$ak&secretKey=$sk&leadId=$leadId&opportunityType=12000"
     try {
-        $r = Invoke-RestMethod -Uri $url -Method Post -ContentType "application/json"
-        if ($r.RecordCount -gt 0) {
-            foreach ($o in $r.List) {
-                $f = @{}
-                foreach ($fld in $o.Fields) { $f[$fld.SchemaName] = $fld.Value }
-                $oppBackup += [pscustomobject]@{
-                    ProspectId    = $leadId
-                    OpportunityId = $o.OpportunityId
-                    Status        = $f["Status"]
-                    Stage         = $f["mx_Custom_2"]
-                    Name          = $f["mx_Custom_1"]
-                }
+        foreach ($o in (Get-LsqOpportunitiesOfLead -ProspectId $leadId -Config $cfg)) {
+            $oppBackup += [pscustomobject]@{
+                ProspectId    = $leadId
+                OpportunityId = $o.OpportunityId
+                Status        = $o.Status
+                Stage         = $o.OppStage
+                Name          = $o.Name
+                OwnerId       = $o.OwnerId
             }
         }
     } catch {
+        $oppReadFailures += $leadId
         Write-LsqLog "Opportunity read failed for lead $leadId -> $($_.Exception.Message) | HTTP: $($_.ErrorDetails.Message)" $logPath
     }
     Start-Sleep -Milliseconds 300
+}
+
+# A backup with holes is worse than no backup, because it looks complete. 03b exists to fill
+# these; say so loudly rather than letting the count below imply a clean run.
+if ($oppReadFailures.Count -gt 0) {
+    Write-LsqLog "WARNING: $($oppReadFailures.Count) lead(s) failed the opportunity read. This backup has HOLES - run 03b-backfill-opportunity-backup-gaps.ps1 before trusting it for rollback." $logPath
+}
+
+# Guard against a backup that silently captured nothing readable (hard rule 4). Every row
+# carrying a null Stage is the exact signature of the $o.Fields bug returning.
+$nullStage = @($oppBackup | Where-Object { [string]::IsNullOrWhiteSpace($_.Stage) }).Count
+if ($oppBackup.Count -gt 0 -and $nullStage -eq $oppBackup.Count) {
+    throw "All $($oppBackup.Count) backed-up opportunities have a blank Stage. That is the gotcha-45 signature, not a real account state. Refusing to write a useless backup."
 }
 $oppPath = Join-Path $dataDir "migration_BACKUP_opportunities_$stamp.json"
 $oppBackup | ConvertTo-Json -Depth 4 | Set-Content -Path $oppPath

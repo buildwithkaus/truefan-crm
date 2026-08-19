@@ -112,7 +112,7 @@ while ($true) {
     }
     # Expand-LsqRows, not @(): ConvertFrom-Json hands the whole array to the pipeline as ONE
     # object, so @() would count 1 and the pager would stop after a single page.
-    $rows = Expand-LsqRows ($resp.Content | ConvertFrom-Json)
+    $rows = @(Expand-LsqRows ($resp.Content | ConvertFrom-Json))
     if ($rows.Count -eq 0) { break }
     foreach ($r in $rows) {
         if ("$($r.changed_at_utc)".StartsWith($MovedOn)) { [void]$ids.Add("$($r.prospect_id)") }

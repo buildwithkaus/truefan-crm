@@ -186,6 +186,17 @@ space-separated values — the data was always there, only the shape was wrong.
 has **no** leading comma — `return , $arr` would suppress unrolling and make `@(Expand-LsqRows ...)`
 read `1` again, reintroducing the exact bug.
 
+**This regressed once already.** On 2026-08-14 the comma was added to make a handful of new bare
+`$rows = Expand-LsqRows ...` call sites safe on single-row pages. Measured immediately afterwards,
+`@(Expand-LsqRows ...)` returned `Count = 1` for a 0-row page, a 1-row page and a 3-row page alike,
+with `[0]` holding the whole inner array — breaking all 78 wrapped call sites at once, including
+`backfill.ps1` and `12-load-contact-book.ps1`. It surfaced as a **negative control returning 1
+instead of 0**, which is the only reason it was caught rather than shipping a truncated scan.
+
+The single-row concern is real but belongs at the call site: use `@(Expand-LsqRows ...)`, never a
+bare assignment. A bare `PSCustomObject` has no `.Count` in PowerShell 5.1 — it reads as empty
+string, not `1`. Do not fix that by changing the contract underneath 78 callers.
+
 ### Corollary — an internal-consistency check is not a reconciliation
 
 `02-build-worklist.ps1` verified `$sum -eq $total` and logged "Reconciliation OK", which a
@@ -450,6 +461,47 @@ The good news buried in this: **the webhook payload is complete.** Activity id, 
 actor, timestamp, status, duration and the note blob all arrive, so recording a call needs
 zero API calls. And **it does fire on telephony-created activities** - proven with real
 handset calls by two reps - which gotcha 11 gave good reason to doubt.
+
+## `GetOpportunitiesOfLead` returns FLAT properties; only `GetOpportunityDetails` has `Fields[]`
+
+Found 2026-08-14, present since the object went live.
+
+The two opportunity reads return **different shapes**, and the repo conflated them:
+
+```
+GetOpportunitiesOfLead   ->  .List[] items are FLAT:
+                             $o.mx_Custom_1, $o.mx_Custom_2, $o.Status, $o.Owner,
+                             $o.OpportunityId, $o.RelatedProspectId, $o.ModifiedOn
+                             There is NO $o.Fields member.
+
+GetOpportunityDetails    ->  .Fields[] is an ARRAY of
+                             { SchemaName, DisplayName, DataType, Value }
+```
+
+Five scripts read `foreach ($fld in $o.Fields)` against the **flat** endpoint. That loop simply
+never executes, so the hashtable stays empty and every field reads `$null`. Nothing throws. The
+record count is right, the row exists, and every value inside it is blank — which looks like an
+empty-but-present opportunity, not a bug.
+
+What it actually cost:
+
+- **`03-backup.ps1` wrote a structurally empty opportunity backup.** Every `Status`, `Stage` and
+  `Name` was null across the whole file, while the log reported a healthy row count. The Phase 5R
+  rollback set for opportunities was worthless for a fortnight and nobody could have known from
+  the output. `03b`, which exists to *fill the gaps* in that backup, had the same bug.
+- **`validate-consistency.ps1`'s V4 check was dead.** Status and Stage were always null, so
+  `Get-ContactStageFromOpportunity` always returned `$null`, so the contact-stage-vs-deal-stage
+  drift check silently passed on every contact it examined.
+- **`sync-engine.ps1` fed empty input to every sync-rules decision.**
+
+Same family as gotcha 24 — an unlabelled, empty field in a payload is not a missing field — and
+the same family as gotcha 2: a shape that returns nothing looks like a fact.
+
+Read through `Get-LsqOpportunitiesOfLead` / `Get-LsqOpportunityDetails` in
+`scripts/lib/opportunity.ps1` rather than hand-rolling either call. Related trap in the same
+scripts: `catch { return @() }` around an opportunity read turns a transport failure into "this
+lead has no deals" — and in a create path that produces a duplicate deal which **cannot be
+deleted** (`CanDelete: false`). The helper throws instead.
 
 ## No bulk Opportunity read endpoint exists
 

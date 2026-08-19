@@ -160,7 +160,7 @@ if ($Scope -eq "Enriched") {
         # how many rows came back - the paging loop then reads "1 row, less than 1000, stop"
         # and reports a complete pass after one page. Same failure family as gotcha 19, and
         # it is why this loop returned 1 candidate against 17,608 contacts on first run.
-        $rows = Expand-LsqRows ($r.Content | ConvertFrom-Json)
+        $rows = @(Expand-LsqRows ($r.Content | ConvertFrom-Json))
         if ($rows.Count -eq 0) { break }
         foreach ($x in $rows) { [void]$candidates.Add("$($x.prospect_id)") }
         if ($rows.Count -lt 1000) { break }

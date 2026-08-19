@@ -25,7 +25,11 @@ param(
     [int]$ThrottleMs = 300
 )
 
+$ErrorActionPreference = "Stop"
+
 . "$PSScriptRoot\..\lib\common.ps1"
+. "$PSScriptRoot\..\lib\schema.ps1"
+. "$PSScriptRoot\..\lib\opportunity.ps1"
 
 $dataDir = Join-Path $PSScriptRoot "..\..\data"
 $logPath = Join-Path $dataDir "migration_backup_log.txt"
@@ -58,29 +62,24 @@ $todo = @($failedIds | Where-Object { -not $haveLead.ContainsKey($_) })
 Write-LsqLog "Leads still missing from the backup: $($todo.Count)" $logPath
 
 $cfg = Import-LsqConfig
-$base = $cfg['LSQ_API_HOST']; $ak = $cfg['LSQ_ACCESS_KEY']; $sk = $cfg['LSQ_SECRET_KEY']
 
 $added = New-Object System.Collections.Generic.List[object]
 $stillFailing = @()
 foreach ($leadId in $todo) {
-    $url = "$base/OpportunityManagement.svc/GetOpportunitiesOfLead?accessKey=$ak&secretKey=$sk&leadId=$leadId&opportunityType=12000"
     try {
-        # Invoke-LsqWithRetry handles the DNS-rotation failures that caused these gaps.
-        $r = Invoke-LsqWithRetry -What "opps for $leadId" -Action {
-            Invoke-RestMethod -Uri $url -Method Post -ContentType "application/json" -ErrorAction Stop
-        }
-        if ($r.RecordCount -gt 0) {
-            foreach ($o in $r.List) {
-                $f = @{}
-                foreach ($fld in $o.Fields) { $f[$fld.SchemaName] = $fld.Value }
-                [void]$added.Add([pscustomobject]@{
-                    ProspectId    = $leadId
-                    OpportunityId = $o.OpportunityId
-                    Status        = $f["Status"]
-                    Stage         = $f["mx_Custom_2"]
-                    Name          = $f["mx_Custom_1"]
-                })
-            }
+        # Get-LsqOpportunitiesOfLead is retry-wrapped, which handles the DNS-rotation failures
+        # that caused these gaps. It also reads FLAT properties: this block used to walk
+        # $o.Fields, which this endpoint does not return (gotcha 45), so every merged row wrote
+        # a null Status/Stage/Name over the gap it was meant to fill. Fixed 2026-08-14.
+        foreach ($o in (Get-LsqOpportunitiesOfLead -ProspectId $leadId -Config $cfg)) {
+            [void]$added.Add([pscustomobject]@{
+                ProspectId    = $leadId
+                OpportunityId = $o.OpportunityId
+                Status        = $o.Status
+                Stage         = $o.OppStage
+                Name          = $o.Name
+                OwnerId       = $o.OwnerId
+            })
         }
     } catch {
         $stillFailing += $leadId

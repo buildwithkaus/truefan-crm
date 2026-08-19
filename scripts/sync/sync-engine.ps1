@@ -53,6 +53,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\..\lib\common.ps1"
+. "$PSScriptRoot\..\lib\schema.ps1"
+. "$PSScriptRoot\..\lib\opportunity.ps1"
 . "$PSScriptRoot\sync-rules.ps1"
 
 $dataDir = Join-Path $PSScriptRoot "..\..\data"
@@ -156,17 +158,26 @@ function Get-CompanyStage {
 }
 
 function Get-LeadOpportunity {
+    <#
+      The lead's furthest-advanced opportunity, $null if it has none, or the string "ERROR" if
+      the read failed. The caller MUST distinguish the last two: treating a failed read as "no
+      deal" makes this engine create a duplicate, and opportunity deletion is blocked.
+
+      Until 2026-08-14 this walked $o.Fields, which GetOpportunitiesOfLead does not return
+      (gotcha 45) - so Status and Stage came back null on every deal, and every downstream
+      sync-rules decision was made on empty input.
+    #>
     param([string]$LeadId)
-    $url = "$base/OpportunityManagement.svc/GetOpportunitiesOfLead?accessKey=$ak&secretKey=$sk&leadId=$LeadId&opportunityType=12000"
     try {
-        $r = Invoke-RestMethod -Uri $url -Method Post -ContentType "application/json"
-        if ($r.RecordCount -gt 0) {
-            $o = $r.List[0]
-            $f = @{}
-            foreach ($fld in $o.Fields) { $f[$fld.SchemaName] = $fld.Value }
-            return @{ Id = $o.OpportunityId; Status = $f["Status"]; Stage = $f["mx_Custom_2"] }
+        $opps = @(Get-LsqOpportunitiesOfLead -ProspectId $LeadId -Config $cfg)
+        if ($opps.Count -eq 0) { return $null }
+        $lead = $opps[0]
+        if ($opps.Count -gt 1) {
+            $ranked = $opps | Sort-Object @{ Expression = { $r = Get-LsqOpportunityStageRank $_.OppStage; if ($null -eq $r) { -1 } else { $r } } } -Descending
+            $lead = $ranked[0]
+            Write-LsqLog "  lead $LeadId has $($opps.Count) opportunities; syncing against the furthest advanced ($($lead.OppStage))" $logPath
         }
-        return $null
+        return @{ Id = $lead.OpportunityId; Status = $lead.Status; Stage = $lead.OppStage; Count = $opps.Count }
     } catch {
         Write-LsqLog "  opportunity read failed for $LeadId -> $($_.Exception.Message)" $logPath
         return "ERROR"

@@ -1,8 +1,28 @@
 <#
 .SYNOPSIS
+  DONE 2026-07-29 (4,404 records). DO NOT RE-RUN - see the WARNING below.
+
   Moves EXISTING Opportunities off the two stage values the Phase 3 backfill hardcoded
   ("Requirement Gathering", "Payment Recieved") onto the new canonical values ("Prospect",
   "Payment Received"), by direct write - because the UI rename cannot do this.
+
+.WARNING
+  RE-RUNNING THIS SCRIPT TODAY WOULD DESTROY THE WARM PIPELINE.
+
+  Its $LegacyMap rewrites "Requirement Gathering" -> "Prospect". That was correct on
+  2026-07-29, when every Opportunity in the account sat on that value because Phase 3 had
+  hardcoded it. It is WRONG now: "Requirement Gathering" has since been re-established as a
+  real, current, WARM stage on the Opportunity object, ranked between Prospect and In
+  Discussion (gotcha 26, and $Script:OpportunityStageRank in scripts/lib/schema.ps1).
+
+  There are ~90 live deals on it. Re-running this would silently demote every one of them to
+  the first stage and erase the distinction between "we are gathering requirements" and "we
+  have not spoken yet" - unrecoverably, since the previous value is not stored anywhere.
+
+  The "Payment Recieved" -> "Payment Received" half is still valid; 2 records remain on the
+  typo. If you need only that, run with -Execute -TypoOnly.
+
+  Guarded by -IAcceptTheRequirementGatheringRisk since 2026-08-14.
 
 .DESCRIPTION
   MANUAL_STEPS.md step 4 assumed renaming the live Opportunity Stage dropdown would carry
@@ -40,8 +60,18 @@
 
 param(
     [switch]$Execute,
-    [int]$ThrottleMs = 400
+    [int]$ThrottleMs = 400,
+
+    # Rewrite ONLY the "Payment Recieved" typo, leaving "Requirement Gathering" alone. This is
+    # the only half of this script that is still safe to run.
+    [switch]$TypoOnly,
+
+    # Required to run the "Requirement Gathering" -> "Prospect" half. Read the WARNING above
+    # before passing it: there is no undo.
+    [switch]$IAcceptTheRequirementGatheringRisk
 )
+
+$ErrorActionPreference = "Stop"
 
 . "$PSScriptRoot\..\lib\common.ps1"
 . "$PSScriptRoot\..\lib\schema.ps1"
@@ -54,11 +84,31 @@ $worklistPath = Join-Path $dataDir "migration_worklist_legacy_opportunity_stages
 $mode = if ($Execute) { "EXECUTE" } else { "DRY RUN" }
 Write-LsqLog "=== Fix legacy Opportunity stage values [$mode] ===" $logPath
 
-# The only two hardcoded-by-Phase-3 values that need moving, and where they go. Status is
-# unchanged in both cases - only the mx_Custom_2 label moves.
+# The two values Phase 3 hardcoded, and where they go. Status is unchanged in both cases -
+# only the mx_Custom_2 label moves.
+#
+# The "Requirement Gathering" entry is now DANGEROUS and is gated. See the WARNING in the
+# header: that value is a live warm stage today, not a legacy artifact, and rewriting it
+# demotes ~90 real deals with no way back.
 $LegacyMap = @{
     "Requirement Gathering" = "Prospect"
     "Payment Recieved"      = "Payment Received"
+}
+
+if ($TypoOnly) {
+    $LegacyMap.Remove("Requirement Gathering")
+    Write-LsqLog "TYPO-ONLY MODE: 'Requirement Gathering' excluded; only the 'Payment Recieved' typo will be rewritten." $logPath
+} elseif (-not $IAcceptTheRequirementGatheringRisk) {
+    throw @"
+REFUSING TO RUN. This script's mapping rewrites 'Requirement Gathering' -> 'Prospect'.
+
+That was correct on 2026-07-29. It is wrong now: 'Requirement Gathering' is a live WARM stage
+on the Opportunity object (~90 deals, gotcha 26), not a legacy value, and this rewrite would
+demote every one of them to the first stage with no undo.
+
+  -TypoOnly                             fix only the 'Payment Recieved' typo (safe)
+  -IAcceptTheRequirementGatheringRisk   run the full original mapping anyway
+"@
 }
 
 $cfg = Import-LsqConfig

@@ -42,10 +42,36 @@ $Script:ContactStages = @("Fresh", "Engaged", "Prospect", "Customer", "Disqualif
 
 $Script:CompanyStages = @("Fresh", "Nurture", "Opportunity", "Customer", "Future Prospect")
 
+# The six live mx_Call_Disposition options, read from the dropdown on 2026-07-31 and kept in
+# step with supabase/functions/_shared/schema.ts (CALL_DISPOSITIONS) and the
+# ref_canonical_value seed in supabase/migrations/001_schema.sql. Kaustubh's decision, recorded
+# in memory/08: the six existing option names stay as they are.
+#
+# This is the SELECTABLE list, not the stored list, and the two have drifted: LeadSquared
+# stores a value that is not in the dropdown instead of rejecting it, so values like
+# 'Not Interested - No Reason Gauged' and 'Requirement Gathering (Warm)' (a contact STAGE
+# sitting in the disposition field) read back fine over the API while no rep can filter them.
+# Compare stored values against this list to find them - do not assume a stored value is valid.
+$Script:CallDispositions = @(
+    "RNR", "Did Not Pick", "Call me Later", "Switched Off/Not Reachable", "Wrong Number", "Follow Up"
+)
+
+# The subset meaning "nobody was reached". Useful as a contradiction test rather than a
+# category: 'Did Not Pick' is demonstrably applied to calls that connected (memory/11), which
+# is worse than leaving the field blank, because a blank field does not assert anything.
+$Script:NoContactDispositions = @("Did Not Pick", "RNR", "Switched Off/Not Reachable")
+
 # Opportunity Stage lives in mx_Custom_2, a dependent dropdown under the native Status
 # field (Status is fixed to Open/Won/Lost and displayed to reps as "Deal Stage").
+#
+# 'Requirement Gathering' sits under Open deliberately. It is not in the original TARGET
+# taxonomy, but it is a real, selectable, live value on this account - 91 open deals were on it
+# on 2026-08-18 - and this table is used to VALIDATE writes. Leaving it out made
+# New-LsqOpportunity reject a faithful restore of an existing Requirement Gathering deal with
+# "not valid under Status 'Open'", which is the tool disagreeing with production, not the data
+# being wrong. See gotcha 26: legacy on the Contact, current and warm on the Opportunity.
 $Script:OpportunityStages = [ordered]@{
-    "Open" = @("Prospect", "In Discussion", "Agreement Sent", "Invoice Sent")
+    "Open" = @("Prospect", "Requirement Gathering", "In Discussion", "Agreement Sent", "Invoice Sent")
     "Won"  = @("Payment Received", "Customer")
     "Lost" = @("Closed - Lost")
 }
@@ -53,14 +79,29 @@ $Script:OpportunityStages = [ordered]@{
 # Canonical forward order. Stage never moves backwards: if a rep sends the invoice before
 # the agreement, the stage sits at the higher-ranked of the two and both date fields are
 # stamped independently.
+#
+# 'Requirement Gathering' is in here deliberately (added 2026-08-14) and is NOT drift. On the
+# OPPORTUNITY it is a real, current, warm stage sitting between Prospect and In Discussion -
+# 90 live deals. Only on the CONTACT is it legacy and an alias of Prospect. That is gotcha 26,
+# and $Script:OpportunityStageRenames below refers to the contact, not to this table.
+#
+# It was missing until 2026-08-14, and the omission was not inert: $rank['Requirement Gathering']
+# returned $null, and PowerShell evaluates ($null -lt 1) as $true, so a warm deal LOST every
+# "keep the furthest advanced" duplicate contest to a brand-new one. Any comparison against this
+# table must go through Get-LsqOpportunityStageRank (scripts/lib/opportunity.ps1), which returns
+# $null plus a warning for an unknown value rather than a silent 0.
+#
+# Mirrors opp_stage_rank() in supabase/migrations/012_deal_taxonomy_and_fields.sql exactly.
+# The two must agree - change them together.
 $Script:OpportunityStageRank = [ordered]@{
-    "Prospect"         = 1
-    "In Discussion"    = 2
-    "Agreement Sent"   = 3
-    "Invoice Sent"     = 4
-    "Payment Received" = 5
-    "Customer"         = 6
-    "Closed - Lost"    = 99
+    "Prospect"              = 1
+    "Requirement Gathering" = 2    # warm; NOT an alias of Prospect on this object
+    "In Discussion"         = 3
+    "Agreement Sent"        = 4
+    "Invoice Sent"          = 5
+    "Payment Received"      = 6
+    "Customer"              = 7
+    "Closed - Lost"         = 99
 }
 
 # Renames to apply to the EXISTING live Opportunity stage dropdown. Applying these means the

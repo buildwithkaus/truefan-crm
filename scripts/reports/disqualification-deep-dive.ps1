@@ -67,9 +67,9 @@ $cols = @(
 # Query wrapper and returns the whole account), and every count below would be the full book.
 # ---------------------------------------------------------------------------------------
 if (-not $SkipNegativeControl) {
-    $nc = Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{
+    $nc = @(Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{
         LookupName = "ProspectStage"; LookupValue = "ZZ_NoSuchStage_ZZ"; SqlOperator = "="
-    } -ColumnsCsv "ProspectID" -PageSize 10)
+    } -ColumnsCsv "ProspectID" -PageSize 10))
     if ($nc.Count -ne 0) {
         throw "NEGATIVE CONTROL FAILED: impossible stage returned $($nc.Count) rows. Filter is not applied - abort."
     }
@@ -85,9 +85,9 @@ $total = 0
 
 Write-Output "Scanning full book, $PageSize/page..."
 while ($true) {
-    $resp = Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{
+    $resp = @(Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{
         LookupName = "CreatedOn"; LookupValue = "2000-01-01"; SqlOperator = ">"
-    } -ColumnsCsv $cols -SortColumn "CreatedOn" -SortDirection "1" -PageIndex $page -PageSize $PageSize)
+    } -ColumnsCsv $cols -SortColumn "CreatedOn" -SortDirection "1" -PageIndex $page -PageSize $PageSize))
 
     if (-not $resp -or $resp.Count -eq 0) { break }
 

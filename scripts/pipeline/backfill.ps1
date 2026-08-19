@@ -22,9 +22,20 @@
   Cost is one API call per contact touched in the window, against a 10,000/day account cap.
   -WhatIf sizes the job without pulling anything.
 
+  SCOPES. By default the candidate set is "every contact touched since -FromDate". -OwnerId
+  swaps that for "every contact in one rep's book, regardless of when it was last touched",
+  which is what a per-rep book-health report needs: a contact nobody has called since June is
+  precisely the one the report is looking for, and the watermark scan excludes it.
+
+  Pair -OwnerId with -FromDate 2000-01-01 to load that rep's LIFETIME call history. It carries
+  its own checkpoint file, so it neither reads nor pollutes the daily watermark checkpoint.
+
 .EXAMPLE
-  pwsh ./scripts/pipeline/backfill.ps1 -FromDate 2026-08-01 -WhatIf
-  pwsh ./scripts/pipeline/backfill.ps1 -FromDate 2026-08-01 -MaxApiCalls 4000
+  powershell.exe -File scripts\pipeline\backfill.ps1 -FromDate 2026-08-01 -WhatIf
+  powershell.exe -File scripts\pipeline\backfill.ps1 -FromDate 2026-08-01 -MaxApiCalls 4000
+
+  # One rep's whole book, lifetime. ~1,900 API calls for a typical book.
+  powershell.exe -File scripts\pipeline\backfill.ps1 -OwnerId 7fb8f9e5-6bd3-11f1-bd10-0a70299d455d -FromDate 2000-01-01 -MaxApiCalls 2500
 
 .NOTES
   ASCII only. Needs SUPABASE_URL and SUPABASE_SERVICE_KEY in config\.env.
@@ -46,6 +57,16 @@ param(
     # that can own an opportunity - which is roughly 1,000 calls instead of 4,000.
     [switch]$DealStagesOnly,
 
+    # Scope the whole pass to ONE rep's book, by owner GUID. Pair it with -FromDate 2000-01-01
+    # to load that rep's LIFETIME call history, which is what any "has this contact ever been
+    # called" question needs - fact_call otherwise begins 2026-08-01, the day the webhook went
+    # live, and every contact worked in June or July reads as never-touched.
+    #
+    # Never accepts a rep NAME. memory/04 records reference data attaching the wrong name to a
+    # real GUID and pulling 2,360 of another rep's leads into a migration; scripts/reports/
+    # rep-book-health.ps1 resolves name -> GUID once, against dim_rep, and passes the GUID.
+    [string]$OwnerId = "",
+
     # Skip contacts whose LAST activity is the Callkaro AI dialler. Cheaper, and LOSSY -
     # ProspectActivityName_Max holds one value, so a contact a rep called earlier the same
     # day is dropped along with its real calls. Off by default. See the block below.
@@ -59,7 +80,16 @@ $ErrorActionPreference = "Stop"
 
 $dataDir = Join-Path $PSScriptRoot "..\..\data"
 $logPath = Join-Path $dataDir "pipeline_backfill_log.txt"
+
+# The checkpoint is scoped to the RUN SHAPE, not just to the script. The default checkpoint
+# records contacts pulled at -FromDate 2026-08-01; reusing it for an owner-scoped lifetime pull
+# would mark those contacts done and their pre-August calls would never load - a silent hole
+# that every subsequent run then reports as a complete pass. That is the same failure shape as
+# the migration bug that logged 25,520 leads as "already at target (skipped)".
 $checkpointPath = Join-Path $dataDir "pipeline_backfill_checkpoint.txt"
+if ($OwnerId) {
+    $checkpointPath = Join-Path $dataDir "pipeline_backfill_checkpoint_owner_$OwnerId.txt"
+}
 
 $cfg = Import-LsqConfig
 foreach ($k in @("SUPABASE_URL", "SUPABASE_SERVICE_KEY")) {
@@ -84,6 +114,18 @@ $neg = @(Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{
 Write-LsqLog "Negative control: $($neg.Count) rows -- must be 0" $logPath
 if ($neg.Count -ne 0) { throw "NEGATIVE CONTROL FAILED - the watermark filter is being ignored." }
 
+# The OwnerId filter is a DIFFERENT filter and gets its own negative control. Proving the
+# watermark filter works says nothing about whether this one is applied - and an ignored owner
+# filter returns the whole 91,000-lead account, which at one API call per trail would run for
+# nine nights against the wrong scope.
+if ($OwnerId) {
+    $negOwner = @(Expand-LsqRows (Invoke-LsqLeadSearch -Filter @{
+        LookupName = "OwnerId"; LookupValue = "00000000-0000-0000-0000-000000000000"; SqlOperator = "="
+    } -ColumnsCsv "ProspectID" -PageSize 10 -SortColumn "CreatedOn"))
+    Write-LsqLog "Negative control (OwnerId): $($negOwner.Count) rows -- must be 0" $logPath
+    if ($negOwner.Count -ne 0) { throw "NEGATIVE CONTROL FAILED - the OwnerId filter is being ignored." }
+}
+
 # ---------------------------------------------------------------------------------------
 # Candidate scan. Sorted by the IMMUTABLE CreatedOn: paging over a column that changes while
 # you page (ProspectActivityDate_Max moves constantly) reshuffles rows between pages and
@@ -96,10 +138,19 @@ $all = New-Object System.Collections.Generic.List[object]
 # Filters to page through. Normally one watermark scan; in deal-stage mode, one scan per
 # deal stage, because only a primary contact at Prospect or Customer can own an opportunity.
 $filters = @()
+if ($DealStagesOnly -and $OwnerId) {
+    throw "-DealStagesOnly and -OwnerId are different scopes and cannot be combined. Pick one."
+}
 if ($DealStagesOnly) {
     Write-LsqLog "DEAL-STAGE MODE: scoping to Prospect and Customer, ignoring the checkpoint." $logPath
     $filters += @{ LookupName = "ProspectStage"; LookupValue = "Prospect"; SqlOperator = "=" }
     $filters += @{ LookupName = "ProspectStage"; LookupValue = "Customer"; SqlOperator = "=" }
+} elseif ($OwnerId) {
+    # Leads.Get takes a SINGLE Parameter - OwnerId cannot be ANDed with a date server side. So
+    # page the owner's whole book here and let the per-activity $fromUtc gate below do the date
+    # narrowing. With -FromDate 2000-01-01 that gate is a no-op and the pull is lifetime.
+    Write-LsqLog "OWNER MODE: scoping the whole book of owner $OwnerId." $logPath
+    $filters += @{ LookupName = "OwnerId"; LookupValue = $OwnerId; SqlOperator = "=" }
 } else {
     $filters += @{ LookupName = "ProspectActivityDate_Max"
                    LookupValue = $fromUtc.ToString("yyyy-MM-dd HH:mm:ss"); SqlOperator = ">" }
@@ -119,7 +170,18 @@ foreach ($filter in $filters) {
     }
 }
 $candidates = $all.ToArray()
-Write-LsqLog "Contacts touched since $FromDate : $($candidates.Count)" $logPath
+if ($OwnerId) {
+    Write-LsqLog "Contacts in owner $OwnerId's book : $($candidates.Count)" $logPath
+    # An ignored owner filter returns the whole account, and the scan would look healthy right
+    # up to the point it spent nine nights of API budget on the wrong scope. Assert the rows
+    # actually carry the owner asked for.
+    $wrongOwner = @($candidates | Where-Object { "$($_.OwnerId)" -ne $OwnerId }).Count
+    if ($wrongOwner -gt 0) {
+        throw "$wrongOwner of $($candidates.Count) scanned contacts have a different OwnerId. The filter is not being applied - abort."
+    }
+} else {
+    Write-LsqLog "Contacts touched since $FromDate : $($candidates.Count)" $logPath
+}
 if ($candidates.Count -eq 0) { throw "Zero candidates - refusing to report a clean empty run." }
 
 # ---------------------------------------------------------------------------------------
